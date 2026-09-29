@@ -1,0 +1,142 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  password      String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  rooms         Room[]    @relation("CreatedRooms")
+  commits       Commit[]
+  messages      Message[]
+}
+
+model Account {
+  id                 String  @id @default(cuid())
+  userId             String
+  type               String
+  provider           String
+  providerAccountId  String
+  refresh_token      String? @db.Text
+  access_token       String? @db.Text
+  expires_at         Int?
+  token_type         String?
+  scope              String?
+  id_token           String? @db.Text
+  session_state      String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model Room {
+  id        String   @id @default(uuid())
+  title     String   @default("Untitled Room")
+  // Legacy single-file fields — kept for backward compat; live state is in File[]
+  code      String   @default("// Welcome to CodeCollab!\n") @db.Text
+  language  String   @default("cpp")
+  creatorId String?
+  creator   User?    @relation("CreatedRooms", fields: [creatorId], references: [id], onDelete: SetNull)
+  files     File[]
+  commits   Commit[]
+  messages  Message[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ── Multi-file workspace ────────────────────────────────────────────────────
+// Each File belongs to a Room. `path` is the logical path within the workspace
+// (e.g. "/main.cpp", "/src/utils.ts"). @@unique ensures no duplicate paths per room.
+model File {
+  id        String   @id @default(cuid())
+  roomId    String
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  name      String            // display name  e.g. "main.cpp"
+  path      String            // logical path  e.g. "/main.cpp"
+  content   String   @db.Text
+  language  String   @default("cpp")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([roomId])
+  @@unique([roomId, path])
+}
+
+model Commit {
+  id            String   @id @default(cuid())
+  message       String
+  // Legacy single-file snapshot (kept for backward compat)
+  code          String   @db.Text
+  language      String   @default("cpp")
+  // Multi-file snapshot: JSON array of { path, name, language, content }
+  filesSnapshot Json?
+  roomId        String
+  room          Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  userId        String?
+  user          User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  authorName    String   @default("Anonymous")
+  createdAt     DateTime @default(now())
+
+  @@index([roomId])
+}
+
+model Message {
+  id         String   @id @default(cuid())
+  content    String   @db.Text
+  roomId     String
+  room       Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  senderName String   @default("Anonymous")
+  createdAt  DateTime @default(now())
+
+  @@index([roomId])
+}
+
+model Submissions {
+  id        String           @id @default(uuid())
+  code      String           @db.Text
+  language  String
+  status    SubmissionStatus @default(Processing)
+  output    String?          @db.Text
+  createdAt DateTime         @default(now())
+}
+
+enum SubmissionStatus {
+  Processing
+  Success
+  Failure
+}

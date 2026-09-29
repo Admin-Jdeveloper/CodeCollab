@@ -1,0 +1,11 @@
+{
+  "name": "codecollab-monorepo",
+  "private": true,
+  "scripts": {
+    "daemon": "bun run local-runner/daemon.ts",
+    "dev:frontend": "cd frontend && bun run dev",
+    "dev:backend": "cd backend && bun run dev",
+    "dev:socket": "cd backend && bun run dev:socket",
+    "prisma": "cd backend && bunx --bun prisma"
+  }
+}
