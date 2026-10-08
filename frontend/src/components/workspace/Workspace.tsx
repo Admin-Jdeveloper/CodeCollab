@@ -3,13 +3,37 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import dynamic from "next/dynamic";
 import type { editor } from "monaco-editor";
-import { useSession } from "next-auth/react";
+import { useSession, signOut } from "next-auth/react";
+import { useTheme } from "next-themes";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+import type { Session } from "next-auth";
+import { getBackendUrl } from "@/lib/urlUtils";
 import {
-  Code2, Share2, Copy, Check, Play, Download,
-  MessageSquare, Send, Loader2, CheckCircle2,
-  Radio, X, GitCommit, History, RotateCcw,
-  FolderOpen, FileCode2,
+  Code2,
+  Share2,
+  Copy,
+  Check,
+  Play,
+  Download,
+  MessageSquare,
+  Send,
+  Loader2,
+  X,
+  GitCommit,
+  History,
+  FolderOpen,
+  FileCode2,
+  ChevronRight,
+  ChevronDown,
+  LogIn,
+  LogOut,
+  GitBranch,
+  Settings,
+  Keyboard,
+  Sliders,
+  Shield,
+  User,
 } from "lucide-react";
 import {
   useRoomSocket,
@@ -20,18 +44,19 @@ import {
 } from "@/hooks/useRoomSocket";
 import { VCSPanel } from "@/components/workspace/VCSPanel";
 import { FileExplorer, type WorkspaceFile } from "@/components/workspace/FileExplorer";
-import { exportCodeFile, exportCommitHistory } from "@/lib/exportUtils";
+import { exportWorkspaceFiles } from "@/lib/exportUtils";
 import { TerminalPanel } from "@/components/workspace/TerminalPanel";
 import { executeCodeLocally, checkLocalDaemon, type ExecutionResult } from "@/lib/localExecution";
-import {
-  parseAntigravityTrigger,
-  getAntigravityEditorDecorations,
-  type AntigravityTriggerResult,
-} from "@/lib/editorParser";
-import { AntigravityOverlay } from "@/components/workspace/AntigravityOverlay";
-import { Orbit } from "lucide-react";
+import { ThemeToggle } from "@/components/ui/theme-toggle";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogFooter } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { CodeCollabLogo } from "@/components/ui/logo";
+import { UserAvatarNav } from "@/components/ui/user-avatar-nav";
+import { showCodeCollabToast } from "@/components/ui/custom-toast";
+import { toast } from "sonner";
 
-// Dynamic Monaco import to prevent SSR
+// Dynamic Monaco import to prevent SSR issues
 const Editor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -50,7 +75,6 @@ function langFromPath(path: string): string {
 }
 
 function langFromMonaco(monacoLang: string): string {
-  // Map internal language state to Monaco's language identifier
   const m: Record<string, string> = { cpp: "cpp", javascript: "javascript", python: "python" };
   return m[monacoLang] ?? monacoLang;
 }
@@ -88,47 +112,96 @@ if __name__ == "__main__":
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
+export type AuthState = "AUTH_LOADING" | "AUTHENTICATED" | "UNAUTHENTICATED" | "AUTH_ERROR";
+
 interface WorkspaceProps {
   roomId: string;
+  initialSession?: Session | null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Component
 // ─────────────────────────────────────────────────────────────────────────────
-export default function Workspace({ roomId }: WorkspaceProps) {
-  const { data: session } = useSession();
+export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
+  const router = useRouter();
+  const { data: session, status } = useSession();
+  const effectiveSession = session ?? initialSession;
 
-  const currentUserId = (session?.user as any)?.id || `anon-${typeof window !== "undefined" ? btoa(roomId).slice(0, 8) : "guest"}`;
-  const currentUserName = session?.user?.name || (session?.user as any)?.email?.split("@")[0] || "Guest Developer";
+  let authState: AuthState = "AUTH_LOADING";
+  if (effectiveSession?.user) {
+    authState = "AUTHENTICATED";
+  } else if (status === "loading" && !initialSession) {
+    authState = "AUTH_LOADING";
+  } else if (status === "unauthenticated" && !initialSession) {
+    authState = "UNAUTHENTICATED";
+  }
+
+  // Redirect to login only after auth is definitely resolved unauthenticated (never while loading)
+  useEffect(() => {
+    if (authState === "UNAUTHENTICATED") {
+      router.replace(`/login?callbackUrl=/room/${encodeURIComponent(roomId)}`);
+    }
+  }, [authState, roomId, router]);
+
+  const { resolvedTheme } = useTheme();
+  const monacoTheme = resolvedTheme === "light" ? "vs" : "vs-dark";
+
+  // Authoritative user identifiers
+  const currentUserId =
+    (effectiveSession?.user as any)?.id ||
+    `anon-${typeof window !== "undefined" ? btoa(roomId).slice(0, 8) : "guest"}`;
+  const currentUserName =
+    effectiveSession?.user?.name || (effectiveSession?.user as any)?.email?.split("@")[0] || "Guest Developer";
 
   // ── Multi-file workspace state ────────────────────────────────────────────
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
+  const [openFilePaths, setOpenFilePaths] = useState<string[]>([]);
 
   const activeFile = files.find((f) => f.path === activeFilePath) ?? null;
   const activeCode = activeFile?.content ?? "";
   const activeLanguage = activeFile?.language ?? "cpp";
 
-  // ── Room metadata ─────────────────────────────────────────────────────────
+  // ── Room metadata & Authoritative Ownership ───────────────────────────────
   const [roomTitle, setRoomTitle] = useState("CodeCollab Room");
+  const [roomBranch, setRoomBranch] = useState("main");
+  const [roomOwnerId, setRoomOwnerId] = useState<string | null>(null);
   const [isCopied, setIsCopied] = useState(false);
+  const isOwner = !roomOwnerId || roomOwnerId === currentUserId;
 
-  // ── Remote-update guard (stealth mode — prevents echo loop) ──────────────
-  // Set to true when applying a remote update; prevents handleCodeChange from
-  // re-emitting the change back to the server.
+  // ── Remote-update guard (stealth mode — prevents echo loops) ──────────────
   const isRemoteUpdateRef = useRef(false);
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof import("monaco-editor") | null>(null);
-
-  // Debounce ref for code emit (reduces socket traffic)
   const codeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ── UI state ──────────────────────────────────────────────────────────────
-  const [activeTab, setActiveTab] = useState<"chat" | "vcs">("chat");
+  // ── Left Sidebar Tab: Files vs VCS ────────────────────────────────────────
+  const [sidebarTab, setSidebarTab] = useState<"files" | "vcs">("files");
+
+  // ── Bottom Terminal State (Dedicated & Resizable) ──────────────────────────
   const [isTerminalOpen, setIsTerminalOpen] = useState(true);
+  const [terminalHeight, setTerminalHeight] = useState(260);
+  const isResizingTerminalRef = useRef(false);
+
+  // ── Modals & Notifications ────────────────────────────────────────────────
   const [isCommitModalOpen, setIsCommitModalOpen] = useState(false);
   const [commitMessage, setCommitMessage] = useState("");
-  const [notification, setNotification] = useState<{ text: string; type: "info" | "success" | "warning" } | null>(null);
+  const [isSavingCommit, setIsSavingCommit] = useState(false);
+  const [isRollingBack, setIsRollingBack] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+
+  // ── Settings & Editor Preferences Modal State ─────────────────────────────
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"editor" | "appearance" | "account" | "shortcuts">("editor");
+  const [editorFontSize, setEditorFontSize] = useState(13);
+  const [editorMinimap, setEditorMinimap] = useState(true);
+  const [editorTabSize, setEditorTabSize] = useState(2);
+
+  // Debounce refs to prevent toaster storms
+  const lastRollbackToastRef = useRef<{ time: number; msg: string }>({ time: 0, msg: "" });
+  const lastCommitToastRef = useRef<{ time: number; id: string; msg: string }>({ time: 0, id: "", msg: "" });
+  const lastUserEventRef = useRef<Map<string, number>>(new Map());
+  const lastSyncToastRef = useRef<number>(0);
 
   // ── Presence & chat state ─────────────────────────────────────────────────
   const [connectedUsers, setConnectedUsers] = useState<PresenceUser[]>([]);
@@ -141,14 +214,17 @@ export default function Workspace({ roomId }: WorkspaceProps) {
 
   // ── Execution state ───────────────────────────────────────────────────────
   const [isExecuting, setIsExecuting] = useState(false);
+  const isExecutingRef = useRef(false);
   const [executionResult, setExecutionResult] = useState<ExecutionResult | null>(null);
   const [stdin, setStdin] = useState("");
   const [daemonActive, setDaemonActive] = useState(false);
 
-  // ── Antigravity easter egg ────────────────────────────────────────────────
-  const [antigravityState, setAntigravityState] = useState<{ active: boolean; info?: AntigravityTriggerResult }>({ active: false });
-  const antigravityDecorationsRef = useRef<string[]>([]);
-  const emitAntigravityRef = useRef<((mode?: string, quote?: string) => void) | null>(null);
+  // Sync open files when activeFilePath changes
+  useEffect(() => {
+    if (activeFilePath && !openFilePaths.includes(activeFilePath)) {
+      setOpenFilePaths((prev) => [...prev, activeFilePath]);
+    }
+  }, [activeFilePath, openFilePaths]);
 
   // Check local daemon
   useEffect(() => {
@@ -157,18 +233,35 @@ export default function Workspace({ roomId }: WorkspaceProps) {
     return () => clearInterval(interval);
   }, []);
 
-  // ── Notification helper ───────────────────────────────────────────────────
-  const showNotification = useCallback((text: string, type: "info" | "success" | "warning" = "info") => {
-    setNotification({ text, type });
-    setTimeout(() => setNotification(null), 3500);
-  }, []);
-
   const handleJumpToLine = (line: number, column = 1) => {
     if (editorRef.current) {
       editorRef.current.revealLineInCenter(line);
       editorRef.current.setPosition({ lineNumber: line, column });
       editorRef.current.focus();
     }
+  };
+
+  // ── Handle resizing of the bottom terminal panel ──────────────────────────
+  const handleMouseDownResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    isResizingTerminalRef.current = true;
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      if (!isResizingTerminalRef.current) return;
+      const newHeight = window.innerHeight - moveEvent.clientY;
+      if (newHeight >= 110 && newHeight <= 680) {
+        setTerminalHeight(newHeight);
+      }
+    };
+
+    const handleMouseUp = () => {
+      isResizingTerminalRef.current = false;
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
   };
 
   // ── Apply remote code smoothly to Monaco (preserves cursor, selections, and undo history) ─
@@ -183,7 +276,6 @@ export default function Workspace({ roomId }: WorkspaceProps) {
 
     isRemoteUpdateRef.current = true;
 
-    // Non-destructive edit execution that preserves buffer integrity & undo stack
     const fullRange = model.getFullModelRange();
     editorRef.current.executeEdits("remote-sync", [
       {
@@ -193,7 +285,6 @@ export default function Workspace({ roomId }: WorkspaceProps) {
       },
     ]);
 
-    // Restore user's cursor position without jumping to line 1
     if (prevPos) {
       const lineCount = model.getLineCount();
       const targetLine = Math.min(prevPos.lineNumber, lineCount);
@@ -209,38 +300,23 @@ export default function Workspace({ roomId }: WorkspaceProps) {
   }, []);
 
   // ── File helper: update a file's content in state ─────────────────────────
-  const updateFileContent = useCallback((filePath: string, content: string) => {
-    setFiles((prev) =>
-      prev.map((f) => (f.path === filePath ? { ...f, content } : f))
-    );
-    // If this is the active file, also apply to Monaco editor directly
-    if (filePath === activeFilePath) {
-      applyRemoteCode(content);
-    }
-  }, [activeFilePath, applyRemoteCode]);
-
-  // ── Antigravity trigger ───────────────────────────────────────────────────
-  const triggerAntigravity = useCallback(
-    (info?: AntigravityTriggerResult, broadcast: boolean = true) => {
-      const parsedInfo = info || parseAntigravityTrigger(activeCode, activeLanguage);
-      setAntigravityState({ active: true, info: parsedInfo });
-      showNotification(`🌌 ${parsedInfo.statement || "import antigravity"} — Zero-G field engaged!`, "success");
-
-      if (editorRef.current && monacoRef.current && parsedInfo.isTriggered) {
-        const decs = getAntigravityEditorDecorations(parsedInfo, monacoRef.current);
-        antigravityDecorationsRef.current = editorRef.current.deltaDecorations(antigravityDecorationsRef.current, decs);
-      }
-
-      if (broadcast && emitAntigravityRef.current) {
-        emitAntigravityRef.current(parsedInfo.mode, parsedInfo.quote);
+  const updateFileContent = useCallback(
+    (filePath: string, content: string) => {
+      setFiles((prev) =>
+        prev.map((f) => (f.path === filePath ? { ...f, content } : f))
+      );
+      if (filePath === activeFilePath) {
+        applyRemoteCode(content);
       }
     },
-    [activeCode, activeLanguage, showNotification]
+    [activeFilePath, applyRemoteCode]
   );
 
   // ── Socket integration ────────────────────────────────────────────────────
   const {
+    connectionStatus,
     emitCodeChange,
+    emitCursor,
     emitLanguageChange,
     emitChatMessage,
     emitCommitSnapshot,
@@ -248,30 +324,71 @@ export default function Workspace({ roomId }: WorkspaceProps) {
     emitFileCreated,
     emitFileDeleted,
     emitFileRenamed,
-    emitAntigravityTrigger,
   } = useRoomSocket(roomId, currentUserId, currentUserName, {
-
-    // Server sends all file states on join
     onRoomState: ({ files: remoteFiles }) => {
       const wsFiles: WorkspaceFile[] = remoteFiles.map((f) => ({
+        id: f.id,
         path: f.path,
-        name: f.path.split("/").pop() ?? f.path,
+        name: f.name || (f.path.split("/").pop() ?? f.path),
         language: f.language,
         content: f.content,
       }));
       setFiles(wsFiles);
       if (wsFiles.length > 0 && !activeFilePath) {
         setActiveFilePath(wsFiles[0]!.path);
+        setOpenFilePaths([wsFiles[0]!.path]);
       }
     },
 
-    // Peer changed a specific file — apply quietly (stealth mode)
     onCodeUpdate: (filePath, remoteCode, senderId) => {
-      if (senderId === currentUserId) return; // ignore own echo
+      if (senderId === currentUserId) return;
       updateFileContent(filePath, remoteCode);
     },
 
-    // Peer changed a file's language
+    onSyncRequired: ({ filePath, content }) => {
+      updateFileContent(filePath, content);
+      const now = Date.now();
+      if (now - lastSyncToastRef.current > 5000) {
+        lastSyncToastRef.current = now;
+        toast.warning("Synchronized with authoritative server version");
+      }
+    },
+
+    onExecutionEvent: (event) => {
+      // Isolate code execution to the user who invoked it: do NOT hijack other peers' terminals
+      if (!isExecutingRef.current && (!event.userId || event.userId !== currentUserId)) {
+        return;
+      }
+      if (event.userId && event.userId !== currentUserId) {
+        return;
+      }
+
+      if (event.status === "RUNNING") {
+        setIsExecuting(true);
+      } else if (
+        event.status === "COMPLETED" ||
+        event.status === "FAILED" ||
+        event.status === "TIMEOUT" ||
+        event.status === "COMPILE_ERROR" ||
+        event.status === "RUNTIME_ERROR" ||
+        event.status === "CANCELLED"
+      ) {
+        setIsExecuting(false);
+        isExecutingRef.current = false;
+        setExecutionResult({
+          success: event.status === "COMPLETED",
+          stdout: event.stdout || "",
+          stderr: event.stderr || "",
+          compilerLog: event.compilerLog || "",
+          exitCode: event.exitCode ?? (event.status === "COMPLETED" ? 0 : 1),
+          executionTimeMs: event.executionTimeMs || 0,
+          diagnostics: [],
+          runtime: "docker-sandbox",
+          runtimeDetails: `Docker Sandbox • Live Result (${event.status})`,
+        });
+      }
+    },
+
     onLanguageUpdate: (filePath, language) => {
       setFiles((prev) =>
         prev.map((f) => (f.path === filePath ? { ...f, language } : f))
@@ -287,19 +404,42 @@ export default function Workspace({ roomId }: WorkspaceProps) {
     },
 
     onPresenceUpdate: (users) => setConnectedUsers(users),
-    onUserJoined: ({ userName }) => showNotification(`${userName} joined the workspace`, "info"),
-    onUserLeft: ({ userName }) => showNotification(`${userName} left the workspace`, "warning"),
+    onUserJoined: ({ userName }) => {
+      if (!userName || userName === currentUserName) return;
+      const now = Date.now();
+      const last = lastUserEventRef.current.get(`join-${userName}`) || 0;
+      if (now - last < 5000) return;
+      lastUserEventRef.current.set(`join-${userName}`, now);
+      toast.info(`${userName} joined the room`);
+    },
+    onUserLeft: ({ userName }) => {
+      if (!userName || userName === currentUserName) return;
+      const now = Date.now();
+      const last = lastUserEventRef.current.get(`leave-${userName}`) || 0;
+      if (now - last < 5000) return;
+      lastUserEventRef.current.set(`leave-${userName}`, now);
+      toast.info(`${userName} left the room`);
+    },
 
     onCommitCreated: (commit) => {
       setCommits((prev) => {
         if (prev.some((c) => c.id === commit.id)) return prev;
         return [commit, ...prev];
       });
-      showNotification(`Snapshot: "${commit.message}" saved`, "success");
+      const now = Date.now();
+      // Suppress toast if we created this commit or toasted recently with the same message
+      if (
+        (lastCommitToastRef.current.msg === commit.message &&
+          now - lastCommitToastRef.current.time < 4000) ||
+        commit.authorName === currentUserName
+      ) {
+        return;
+      }
+      lastCommitToastRef.current = { time: now, id: commit.id, msg: commit.message };
+      toast.info(`${commit.authorName || "Peer"} saved snapshot: "${commit.message}"`);
     },
 
-    // Rollback applied — restore ALL files and apply active file to Monaco directly
-    onRollbackApplied: ({ filesSnapshot, code: legacyCode, language: legacyLang, commitMessage: msg }) => {
+    onRollbackApplied: ({ filesSnapshot, code: legacyCode, commitMessage: msg }) => {
       if (filesSnapshot && filesSnapshot.length > 0) {
         const wsFiles: WorkspaceFile[] = filesSnapshot.map((f) => ({
           path: f.path,
@@ -309,21 +449,22 @@ export default function Workspace({ roomId }: WorkspaceProps) {
         }));
         setFiles(wsFiles);
 
-        // Apply active file directly to Monaco (bypasses React state async timing)
         const currentActive = activeFilePath ?? filesSnapshot[0]!.path;
         const activeSnap = filesSnapshot.find((f) => f.path === currentActive) ?? filesSnapshot[0]!;
         setActiveFilePath(activeSnap.path);
         applyRemoteCode(activeSnap.content);
       } else {
-        // Legacy single-file rollback
         if (activeFilePath) {
           updateFileContent(activeFilePath, legacyCode);
         }
       }
-      showNotification(`↩ Rolled back to: "${msg}"`, "info");
+      const now = Date.now();
+      if (now - lastRollbackToastRef.current.time > 3000 || lastRollbackToastRef.current.msg !== msg) {
+        lastRollbackToastRef.current = { time: now, msg };
+        toast.info(`↩ Rolled back to: "${msg}"`);
+      }
     },
 
-    // Peer created a new file
     onFileCreated: ({ filePath, name, language, content }) => {
       setFiles((prev) => {
         if (prev.some((f) => f.path === filePath)) return prev;
@@ -331,60 +472,71 @@ export default function Workspace({ roomId }: WorkspaceProps) {
       });
     },
 
-    // Peer deleted a file
-    onFileDeleted: ({ filePath }) => {
-      setFiles((prev) => {
-        const next = prev.filter((f) => f.path !== filePath);
-        return next;
+    onFileDeleteFailed: ({ error }) => {
+      showCodeCollabToast({
+        type: "error",
+        title: "Could not delete file",
+        message: error || "Permission denied: Only the workspace owner can delete files.",
       });
+    },
+
+    onFileDeleted: ({ filePath }) => {
+      setFiles((prev) => prev.filter((f) => f.path !== filePath));
+      setOpenFilePaths((prev) => prev.filter((p) => p !== filePath));
       setActiveFilePath((curr) => {
-        if (curr === filePath) return files.find((f) => f.path !== filePath)?.path ?? null;
+        if (curr === filePath) {
+          const remaining = files.filter((f) => f.path !== filePath);
+          return remaining.length > 0 ? remaining[0]!.path : null;
+        }
         return curr;
       });
+      const fileName = filePath.replace(/^\//, "");
+      showCodeCollabToast({
+        type: "info",
+        title: "File deleted",
+        message: `${fileName} was removed by collaborator.`,
+      });
     },
 
-    // Peer renamed a file
     onFileRenamed: ({ oldPath, newPath, newName }) => {
       setFiles((prev) =>
-        prev.map((f) => f.path === oldPath ? { ...f, path: newPath, name: newName } : f)
+        prev.map((f) =>
+          f.path === oldPath ? { ...f, path: newPath, name: newName } : f
+        )
       );
-      setActiveFilePath((curr) => curr === oldPath ? newPath : curr);
+      setOpenFilePaths((prev) =>
+        prev.map((p) => (p === oldPath ? newPath : p))
+      );
+      setActiveFilePath((curr) => (curr === oldPath ? newPath : curr));
     },
-
-    onAntigravityTriggered: ({ senderName, mode, quote }) => {
-      if (senderName !== currentUserName) {
-        showNotification(`🚀 ${senderName} activated Zero-G antigravity flight!`, "info");
-        triggerAntigravity(
-          { isTriggered: true, line: 1, column: 1, statement: "import antigravity", syntax: "python", mode: (mode as any) || "zero-g", message: `${senderName} initiated zero-gravity!`, quote: quote || `"How are you flying? Python!"` },
-          false
-        );
-      }
-    },
+  }, {
+    enabled: authState === "AUTHENTICATED",
   });
 
-  useEffect(() => { emitAntigravityRef.current = emitAntigravityTrigger; }, [emitAntigravityTrigger]);
-
+  // Load initial room state from REST
   useEffect(() => {
-    const handleCustomAntigravity = (e: any) => { if (e.detail?.isTriggered) triggerAntigravity(e.detail, true); };
-    window.addEventListener("codecollab:antigravity", handleCustomAntigravity);
-    return () => window.removeEventListener("codecollab:antigravity", handleCustomAntigravity);
-  }, [triggerAntigravity]);
-
-  // ── Load initial room state from REST (before socket connects) ───────────
-  useEffect(() => {
-    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:3000";
-    fetch(`${backendUrl}/api/room/${roomId}`)
-      .then((r) => (r.ok ? r.json() : null))
+    const backendUrl = getBackendUrl();
+    const query = currentUserId ? `?userId=${encodeURIComponent(currentUserId)}` : "";
+    fetch(`${backendUrl}/api/room/${roomId}${query}`)
+      .then((r) => {
+        if (r.status === 403) {
+          toast.error("You do not have permission to access this private workspace");
+          router.replace("/");
+          return null;
+        }
+        return r.ok ? r.json() : null;
+      })
       .then((data) => {
         if (!data?.room) return;
+        if (data.room.creatorId) setRoomOwnerId(data.room.creatorId);
         if (data.room.title) setRoomTitle(data.room.title);
+        if (data.room.branch) setRoomBranch(data.room.branch);
         if (data.room.commits) setCommits(data.room.commits);
         if (data.room.messages) setMessages(data.room.messages);
 
-        // Seed files from REST if socket hasn't provided them yet
         if (data.room.files?.length > 0) {
           setFiles((prev) => {
-            if (prev.length > 0) return prev; // socket already hydrated
+            if (prev.length > 0) return prev;
             const wsFiles: WorkspaceFile[] = data.room.files.map((f: any) => ({
               path: f.path,
               name: f.name,
@@ -392,15 +544,18 @@ export default function Workspace({ roomId }: WorkspaceProps) {
               content: f.content,
             }));
             setActiveFilePath(wsFiles[0]!.path);
+            setOpenFilePaths([wsFiles[0]!.path]);
             return wsFiles;
           });
         }
       })
       .catch(() => {});
-  }, [roomId]);
+  }, [roomId, currentUserId, router]);
 
   // Auto-scroll chat
-  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   // ── Monaco mount handler ──────────────────────────────────────────────────
   const handleEditorMount = useCallback(
@@ -408,15 +563,16 @@ export default function Workspace({ roomId }: WorkspaceProps) {
       editorRef.current = ed;
       monacoRef.current = monaco;
 
-      // Check antigravity on initial load
-      const initialTrigger = parseAntigravityTrigger(activeCode, activeLanguage);
-      if (initialTrigger.isTriggered) {
-        const decs = getAntigravityEditorDecorations(initialTrigger, monaco);
-        antigravityDecorationsRef.current = ed.deltaDecorations([], decs);
-      }
+      ed.onDidChangeCursorPosition((e) => {
+        if (activeFilePath) {
+          emitCursor(activeFilePath, {
+            lineNumber: e.position.lineNumber,
+            column: e.position.column,
+          });
+        }
+      });
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    []
+    [activeFilePath, emitCursor]
   );
 
   // ── Monaco onChange handler ───────────────────────────────────────────────
@@ -424,73 +580,79 @@ export default function Workspace({ roomId }: WorkspaceProps) {
     (value: string | undefined) => {
       const newCode = value ?? "";
 
-      // Clear error markers on edit
       if (monacoRef.current && editorRef.current) {
         const model = editorRef.current.getModel();
         if (model) monacoRef.current.editor.setModelMarkers(model, "diagnostics", []);
       }
 
-      // STEALTH MODE: if this change was applied remotely, do NOT re-emit it
       if (isRemoteUpdateRef.current) return;
 
-      // Update local file state
       if (activeFilePath) {
         setFiles((prev) =>
           prev.map((f) => (f.path === activeFilePath ? { ...f, content: newCode } : f))
         );
       }
 
-      // Low-latency emit (30ms debounce) for seamless live collaboration
       if (codeDebounceRef.current) clearTimeout(codeDebounceRef.current);
       codeDebounceRef.current = setTimeout(() => {
         if (activeFilePath) {
           emitCodeChange(activeFilePath, newCode, activeLanguage);
         }
-
-        // Antigravity easter egg check
-        const triggerResult = parseAntigravityTrigger(newCode, activeLanguage);
-        if (triggerResult.isTriggered) {
-          triggerAntigravity(triggerResult, true);
-        } else if (editorRef.current && antigravityDecorationsRef.current.length > 0) {
-          antigravityDecorationsRef.current = editorRef.current.deltaDecorations(antigravityDecorationsRef.current, []);
-        }
       }, 30);
     },
-    [activeFilePath, activeLanguage, emitCodeChange, triggerAntigravity]
+    [activeFilePath, activeLanguage, emitCodeChange]
   );
 
   // ── File Explorer handlers ────────────────────────────────────────────────
   const handleFileSelect = (file: WorkspaceFile) => {
     setActiveFilePath(file.path);
-    // Clear error markers when switching files
+    if (!openFilePaths.includes(file.path)) {
+      setOpenFilePaths((prev) => [...prev, file.path]);
+    }
     if (monacoRef.current && editorRef.current) {
       const model = editorRef.current.getModel();
       if (model) monacoRef.current.editor.setModelMarkers(model, "diagnostics", []);
     }
   };
 
+  const handleCloseFileTab = (path: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const nextOpen = openFilePaths.filter((p) => p !== path);
+    setOpenFilePaths(nextOpen);
+    if (activeFilePath === path) {
+      setActiveFilePath(nextOpen.length > 0 ? nextOpen[nextOpen.length - 1] : null);
+    }
+  };
+
   const handleFileCreate = (name: string, language: string) => {
     const path = `/${name}`;
     const content = STARTER_CONTENT[language] ?? `// ${name}\n`;
-    // Emit to all peers (server persists)
     emitFileCreated(path, name, language, content);
-    // Optimistic local update
     setFiles((prev) => {
       if (prev.some((f) => f.path === path)) return prev;
       return [...prev, { path, name, language, content }];
     });
     setActiveFilePath(path);
+    if (!openFilePaths.includes(path)) {
+      setOpenFilePaths((prev) => [...prev, path]);
+    }
   };
 
   const handleFileDelete = (file: WorkspaceFile) => {
     emitFileDeleted(file.path);
-    setFiles((prev) => {
-      const next = prev.filter((f) => f.path !== file.path);
-      return next;
-    });
+    setFiles((prev) => prev.filter((f) => f.path !== file.path));
+    setOpenFilePaths((prev) => prev.filter((p) => p !== file.path));
     setActiveFilePath((curr) => {
-      if (curr === file.path) return files.find((f) => f.path !== file.path)?.path ?? null;
+      if (curr === file.path) {
+        const remaining = files.filter((f) => f.path !== file.path);
+        return remaining.length > 0 ? remaining[0]!.path : null;
+      }
       return curr;
+    });
+    showCodeCollabToast({
+      type: "success",
+      title: "File deleted",
+      message: `${file.name} was removed.`,
     });
   };
 
@@ -499,15 +661,21 @@ export default function Workspace({ roomId }: WorkspaceProps) {
     const newLanguage = langFromPath(newName);
     emitFileRenamed(file.path, newPath, newName);
     setFiles((prev) =>
-      prev.map((f) => f.path === file.path ? { ...f, path: newPath, name: newName, language: newLanguage } : f)
+      prev.map((f) =>
+        f.path === file.path ? { ...f, path: newPath, name: newName, language: newLanguage } : f
+      )
+    );
+    setOpenFilePaths((prev) =>
+      prev.map((p) => (p === file.path ? newPath : p))
     );
     if (activeFilePath === file.path) setActiveFilePath(newPath);
   };
 
-  // ── Language switch ───────────────────────────────────────────────────────
   const handleLanguageChange = (lang: "cpp" | "javascript" | "python") => {
     if (!activeFilePath) return;
-    setFiles((prev) => prev.map((f) => f.path === activeFilePath ? { ...f, language: lang } : f));
+    setFiles((prev) =>
+      prev.map((f) => (f.path === activeFilePath ? { ...f, language: lang } : f))
+    );
     emitLanguageChange(activeFilePath, lang);
   };
 
@@ -523,24 +691,58 @@ export default function Workspace({ roomId }: WorkspaceProps) {
   // ── Commit snapshot ───────────────────────────────────────────────────────
   const handleSaveCommit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!commitMessage.trim()) return;
-    const snapshot: FileSnapshot[] = files.map((f) => ({ path: f.path, name: f.name, language: f.language, content: f.content }));
-    emitCommitSnapshot(commitMessage.trim(), snapshot, currentUserName);
-    setCommitMessage("");
-    setIsCommitModalOpen(false);
+    const msg = commitMessage.trim();
+    if (!msg || isSavingCommit) return;
+    setIsSavingCommit(true);
+    try {
+      const snapshot: FileSnapshot[] = files.map((f) => ({
+        path: f.path,
+        name: f.name,
+        language: f.language,
+        content: f.content,
+      }));
+      emitCommitSnapshot(msg, snapshot, currentUserName);
+      lastCommitToastRef.current = { time: Date.now(), id: "", msg };
+      setCommitMessage("");
+      setIsCommitModalOpen(false);
+      toast.success("Snapshot milestone recorded!");
+    } finally {
+      setTimeout(() => setIsSavingCommit(false), 1500);
+    }
   };
 
-  // ── Rollback ──────────────────────────────────────────────────────────────
   const handleRollback = (commit: CommitSnapshot) => {
-    if (!confirm(`↩ Roll back the entire workspace to:\n"${commit.message}"?\n\nAll peers will see this change.`)) return;
+    if (isRollingBack) return;
+    setIsRollingBack(true);
     emitRollback(commit.id);
+    setTimeout(() => setIsRollingBack(false), 2500);
   };
 
   // ── Export ────────────────────────────────────────────────────────────────
-  const handleExport = () => {
-    if (!activeFile) return;
-    exportCodeFile({ code: activeFile.content, language: activeFile.language, roomId, roomTitle, authorName: currentUserName });
-    showNotification(`Exported ${activeFile.name}`, "success");
+  const handleExport = async () => {
+    if (isExporting) return;
+    if (files.length === 0) {
+      toast.error("No files in workspace to export");
+      return;
+    }
+    setIsExporting(true);
+    try {
+      const res = await exportWorkspaceFiles({
+        files,
+        roomTitle,
+        roomId,
+      });
+      toast.success(
+        res.count === 1
+          ? `Exported ${res.filename}`
+          : `Exported ${res.count} files (${res.filename})`
+      );
+    } catch (err: any) {
+      console.error("[Workspace] export error:", err);
+      toast.error(err?.message || "Failed to export workspace");
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   // ── Copy room link ────────────────────────────────────────────────────────
@@ -548,19 +750,29 @@ export default function Workspace({ roomId }: WorkspaceProps) {
     if (typeof window !== "undefined") {
       navigator.clipboard.writeText(window.location.href);
       setIsCopied(true);
+      toast.success("Room link copied to clipboard!");
       setTimeout(() => setIsCopied(false), 2000);
     }
   };
 
   // ── Execute code ──────────────────────────────────────────────────────────
   const handleExecute = async () => {
-    if (!activeFile) return;
+    if (!activeFile || isExecuting) return;
+    isExecutingRef.current = true;
     setIsExecuting(true);
+    // Automatically open the dedicated bottom terminal on execution
     setIsTerminalOpen(true);
 
     try {
       const codeToRun = editorRef.current ? editorRef.current.getValue() : activeFile.content;
-      const result = await executeCodeLocally({ language: activeFile.language, code: codeToRun, input: stdin });
+      const result = await executeCodeLocally({
+        language: activeFile.language,
+        code: codeToRun,
+        input: stdin,
+        roomId,
+        fileId: activeFile.id,
+        userId: currentUserId,
+      });
       setExecutionResult(result);
 
       if (monacoRef.current && editorRef.current) {
@@ -579,102 +791,156 @@ export default function Workspace({ roomId }: WorkspaceProps) {
         }
       }
 
-      if (result.success) showNotification(`Execution finished in ${result.executionTimeMs}ms`, "success");
-      else showNotification(`Execution finished with exit code ${result.exitCode}`, "warning");
+      if (result.success) toast.success(`Executed cleanly in ${result.executionTimeMs}ms`);
+      else toast.warning(`Execution exited with code ${result.exitCode}`);
     } catch (err: any) {
-      showNotification(`Execution failed: ${err.message}`, "warning");
+      toast.error(`Execution failed: ${err.message}`);
     } finally {
       setIsExecuting(false);
+      isExecutingRef.current = false;
     }
   };
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Derived
-  // ─────────────────────────────────────────────────────────────────────────
-  const langLabel = { cpp: "C++", javascript: "JavaScript", python: "Python" }[activeLanguage] ?? activeLanguage;
+  const langLabel =
+    { cpp: "C++", javascript: "JavaScript", python: "Python" }[activeLanguage] ?? activeLanguage;
+
+  // Global keyboard shortcuts: Ctrl/Cmd+Enter -> Run, Ctrl/Cmd+S -> Save Snapshot
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        e.preventDefault();
+        if (!isExecutingRef.current && activeFile) {
+          handleExecute();
+        }
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        setIsCommitModalOpen(true);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [activeFile]);
+
+  if (authState === "AUTH_LOADING") {
+    return (
+      <div className="h-screen w-screen flex flex-col items-center justify-center bg-[#F5F3EE] dark:bg-[#0A0A0A] text-[#111111] dark:text-[#F5F3EE]">
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="w-8 h-8 text-[#A8D8FF] animate-spin" />
+          <p className="text-xs font-mono text-[#71717A] dark:text-[#A1A1AA]">Initializing secure workspace session...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div
-      className={`h-screen w-screen flex flex-col bg-zinc-950 text-zinc-100 overflow-hidden select-none transition-all duration-700 ${
-        antigravityState.active ? "bg-[#060813]" : ""
-      }`}
-    >
-      {/* ────────────────── Notification Toast ──────────────────── */}
-      {notification && (
-        <div
-          className={`fixed top-4 right-4 z-[100] flex items-center gap-2.5 px-4 py-2.5 rounded-2xl text-xs font-semibold shadow-xl border backdrop-blur-sm transition-all duration-300 ${
-            notification.type === "success"
-              ? "bg-emerald-950/90 border-emerald-700/50 text-emerald-300"
-              : notification.type === "warning"
-              ? "bg-amber-950/90 border-amber-700/50 text-amber-300"
-              : "bg-indigo-950/90 border-indigo-700/50 text-indigo-300"
-          }`}
-        >
-          {notification.type === "success" ? <CheckCircle2 className="w-3.5 h-3.5" /> : <Radio className="w-3.5 h-3.5 animate-pulse" />}
-          <span>{notification.text}</span>
-          <button onClick={() => setNotification(null)} className="ml-1 opacity-70 hover:opacity-100">
-            <X className="w-3 h-3" />
-          </button>
-        </div>
-      )}
-
-      {/* ────────────────── Antigravity Overlay ─────────────────── */}
-      <AntigravityOverlay
-        active={antigravityState.active}
-        onClose={() => setAntigravityState({ active: false })}
-        mode={antigravityState.info?.mode}
-        triggerQuote={antigravityState.info?.quote}
-        triggerStatement={antigravityState.info?.statement}
-      />
-
-      {/* ────────────────── Top Nav Bar ─────────────────────────── */}
-      <header className="h-14 border-b border-zinc-800/60 bg-zinc-900/80 backdrop-blur-sm px-4 flex items-center justify-between shrink-0 z-20 shadow-sm shadow-zinc-950/50">
-        {/* Left */}
-        <div className="flex items-center gap-3 min-w-0">
-          <Link href="/" className="flex items-center gap-2 group shrink-0">
-            <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center shadow-md shadow-indigo-600/20 group-hover:scale-105 transition-transform duration-200">
-              <Code2 className="w-4 h-4 text-white" />
-            </div>
-            <span className="font-bold text-sm tracking-tight text-white hidden sm:inline">
-              Code<span className="text-indigo-400">Collab</span>
-            </span>
+    <div className="h-screen w-screen flex flex-col bg-[#F2F2F0] dark:bg-[#000000] text-[#18181B] dark:text-[#F5F5F5] overflow-hidden select-none transition-colors duration-200">
+      {/* ────────────────── Top Header Bar ─────────────────────────── */}
+      <header className="h-14 border-b border-[#D4D4D4] dark:border-[#27272A] bg-[#FFFFFF]/95 dark:bg-[#000000]/95 backdrop-blur-md px-4 flex items-center justify-between shrink-0 z-20 transition-colors duration-200 shadow-xs">
+        {/* Left: Breadcrumbs showing Room Name and ID */}
+        <div className="flex items-center gap-2.5 min-w-0">
+          <Link href="/" className="group shrink-0" title="Back to Dashboard">
+            <CodeCollabLogo withText size="sm" />
           </Link>
 
-          <div className="h-4 w-px bg-zinc-800 hidden sm:block" />
+          <ChevronRight className="w-3.5 h-3.5 text-[#71717A] shrink-0" />
 
+          {/* Room Name Breadcrumb (Editable) */}
           <input
             type="text"
             value={roomTitle}
             onChange={(e) => setRoomTitle(e.target.value)}
-            className="bg-transparent text-sm font-semibold text-zinc-200 hover:bg-zinc-800/60 focus:bg-zinc-900 px-2 py-1 rounded-xl border border-transparent focus:border-zinc-700 outline-none max-w-[160px] truncate transition-colors duration-200"
+            title="Edit workspace title"
+            className="bg-transparent text-xs sm:text-sm font-semibold text-[#18181B] dark:text-[#F5F5F5] hover:bg-[#F2F2F0] dark:hover:bg-[#181818] focus:bg-[#FFFFFF] dark:focus:bg-[#111111] px-2 py-1 rounded-lg border border-transparent focus:border-[#7DB9E8] dark:focus:border-[#A8D8FF] outline-none max-w-[130px] sm:max-w-[180px] truncate transition-colors"
           />
 
+          <ChevronRight className="w-3.5 h-3.5 text-[#71717A] shrink-0" />
+
+          {/* Room ID Badge with Copy */}
           <button
             onClick={handleCopyLink}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700/80 text-xs font-mono text-indigo-300 transition-all duration-200 shadow-sm shrink-0"
-            title="Copy invite link"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#FFFFFF] dark:bg-[#181818] hover:bg-[#F2F2F0] dark:hover:bg-[#27272A] border border-[#D4D4D4] dark:border-[#27272A] text-xs font-mono text-[#18181B] dark:text-[#F5F5F5] transition-colors shrink-0 cursor-pointer"
+            title="Copy room link"
           >
             {isCopied ? (
-              <><Check className="w-3.5 h-3.5 text-emerald-400" /><span className="text-emerald-400 text-[11px]">Copied!</span></>
+              <>
+                <Check className="w-3 h-3 text-[#10B981]" />
+                <span className="text-[11px] text-[#059669] dark:text-[#34D399] font-semibold">Copied!</span>
+              </>
             ) : (
-              <><Share2 className="w-3 h-3 text-zinc-400" /><span className="text-[11px] truncate max-w-[80px]">{roomId.slice(0, 10)}…</span><Copy className="w-3 h-3 text-zinc-500" /></>
+              <>
+                <span className="text-[11px] text-[#71717A] dark:text-[#52525B]">#</span>
+                <span className="text-[11px] truncate max-w-[70px] sm:max-w-[90px]">{roomId}</span>
+                <Copy className="w-3 h-3 text-[#71717A]" />
+              </>
             )}
           </button>
+
+          {/* Active Branch Pill */}
+          <div
+            className="hidden sm:flex items-center gap-1.5 px-2 py-1 rounded-lg bg-[#E8E1D5]/40 dark:bg-[#18181B] border border-[#DCD6CA] dark:border-[#27272A] text-[#111111] dark:text-[#E8E1D5] font-mono text-[11px] shrink-0"
+            title={`Active Branch: ${roomBranch}`}
+          >
+            <GitBranch className="w-3 h-3 text-[#A8D8FF]" />
+            <span>{roomBranch}</span>
+          </div>
         </div>
 
-        {/* Center: Language + Presence */}
-        <div className="flex items-center gap-3">
-          <div className="flex items-center bg-zinc-900 border border-zinc-800 p-0.5 rounded-xl text-xs">
+        {/* Center: Active Participants section with user avatars, status dots, and live peer count */}
+        <div className="hidden lg:flex items-center gap-2.5">
+          <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-[#E8E1D5]/35 dark:bg-[#18181B] border border-[#DCD6CA] dark:border-[#27272A] shadow-xs">
+            {/* Avatars */}
+            <div className="flex items-center -space-x-1.5">
+              {connectedUsers.slice(0, 4).map((u) => (
+                <div
+                  key={u.socketId}
+                  title={`${u.userName} (${(u as any).role || "collaborator"})`}
+                  style={{ backgroundColor: u.color }}
+                  className="w-6 h-6 rounded-full ring-2 ring-white dark:ring-[#0A0A0A] text-[10px] font-bold text-white flex items-center justify-center uppercase shadow-xs shrink-0 cursor-default"
+                >
+                  {u.userName.charAt(0)}
+                </div>
+              ))}
+            </div>
+
+            {/* Live Peer Count & Reconnection Status Indicator */}
+            <div className="flex items-center gap-1.5 text-xs font-medium text-[#111111] dark:text-[#F5F3EE] pl-0.5 font-mono">
+              {connectionStatus === "connected" && (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-[#10B981] animate-pulse" />
+                  <span className="text-[11px] font-semibold text-[#059669] dark:text-[#34D399]">Connected</span>
+                </>
+              )}
+              {connectionStatus === "reconnecting" && (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-[#F59E0B] animate-ping" />
+                  <span className="text-[11px] font-semibold text-[#D97706] dark:text-[#FBBF24]">Reconnecting...</span>
+                </>
+              )}
+              {connectionStatus === "disconnected" && (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-[#EF4444]" />
+                  <span className="text-[11px] font-semibold text-[#DC2626] dark:text-[#F87171]">Offline</span>
+                </>
+              )}
+              <span className="text-[#DCD6CA] dark:text-[#27272A]">•</span>
+              <span className="text-[11px] font-semibold">{connectedUsers.length} live</span>
+            </div>
+          </div>
+
+          {/* Quick Language Badges */}
+          <div className="hidden xl:flex items-center bg-[#E8E1D5]/40 dark:bg-[#18181B] p-0.5 rounded-lg border border-[#DCD6CA] dark:border-[#27272A] text-xs">
             {(["cpp", "javascript", "python"] as const).map((l) => {
               const active = activeLanguage === l;
-              const color = { cpp: "indigo", javascript: "amber", python: "emerald" }[l];
               const label = { cpp: "C++", javascript: "JS", python: "Python" }[l];
               return (
                 <button
                   key={l}
                   onClick={() => handleLanguageChange(l)}
-                  className={`px-2.5 py-1 rounded-lg font-semibold transition-all duration-200 ${
-                    active ? `bg-${color}-600 text-white shadow-sm` : "text-zinc-400 hover:text-zinc-200"
+                  className={`px-2.5 py-1 rounded-md text-[11px] font-semibold transition-all cursor-pointer ${
+                    active
+                      ? "bg-[#A8D8FF] text-[#0A0A0A] font-bold shadow-xs"
+                      : "text-[#71717A] dark:text-[#A1A1AA] hover:text-[#111111] dark:hover:text-[#FFFFFF]"
                   }`}
                 >
                   {label}
@@ -682,123 +948,268 @@ export default function Workspace({ roomId }: WorkspaceProps) {
               );
             })}
           </div>
-
-          {/* Presence avatars */}
-          <div className="hidden md:flex items-center gap-1.5">
-            <div className="flex items-center -space-x-1.5">
-              {connectedUsers.slice(0, 5).map((u) => (
-                <div
-                  key={u.socketId}
-                  title={u.userName}
-                  style={{ backgroundColor: u.color }}
-                  className="w-6 h-6 rounded-full ring-2 ring-zinc-900 text-[10px] font-bold text-white flex items-center justify-center uppercase shadow-sm cursor-default shrink-0"
-                >
-                  {u.userName.charAt(0)}
-                </div>
-              ))}
-            </div>
-            <div className="flex items-center gap-1 text-[11px] text-zinc-400 pl-1">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span>{connectedUsers.length} live</span>
-            </div>
-          </div>
         </div>
 
-        {/* Right: Actions */}
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => triggerAntigravity(undefined, true)}
-            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-semibold transition-all duration-200 ${
-              antigravityState.active
-                ? "bg-indigo-600 text-white border-indigo-400 shadow-md shadow-indigo-600/30 animate-pulse"
-                : "bg-zinc-900/90 hover:bg-zinc-800 text-indigo-300 border-zinc-700/80 hover:border-indigo-500/40"
-            }`}
-          >
-            <Orbit className={`w-3.5 h-3.5 ${antigravityState.active ? "animate-spin text-white" : "text-indigo-400"}`} />
-            <span className="hidden sm:inline">Zero-G</span>
-          </button>
+        {/* Right Action Toolbar: Theme Toggle, Commit, Export, Share Link, Run, Settings, and Auth Status */}
+        <div className="flex items-center gap-1.5 sm:gap-2">
+          {/* Compact Language Selector on md/lg screens */}
+          <div className="flex xl:hidden items-center">
+            <select
+              value={activeLanguage}
+              onChange={(e) => handleLanguageChange(e.target.value as "cpp" | "javascript" | "python")}
+              className="h-8 px-2 rounded-lg bg-[#FFFFFF] dark:bg-[#181818] border border-[#D4D4D4] dark:border-[#27272A] text-xs font-mono font-medium text-[#18181B] dark:text-[#F5F5F5] outline-none cursor-pointer"
+              title="Select Programming Language"
+            >
+              <option value="cpp">C++</option>
+              <option value="javascript">JavaScript</option>
+              <option value="python">Python</option>
+            </select>
+          </div>
 
-          <button
+          {/* Theme Toggle (Sun/Moon) */}
+          <ThemeToggle />
+
+          {/* Commit/VCS Modal Trigger */}
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => setIsCommitModalOpen(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-700/80 text-xs font-medium transition-colors duration-200"
+            className="h-8 text-xs font-medium"
+            title="Save Version Snapshot (Ctrl+S)"
           >
-            <GitCommit className="w-3.5 h-3.5 text-violet-400" />
+            <GitCommit className="w-3.5 h-3.5 text-[#A8D8FF]" />
             <span className="hidden sm:inline">Commit</span>
-          </button>
-          <button
+          </Button>
+
+          {/* Export File Button */}
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={handleExport}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border border-zinc-700/80 text-xs font-medium transition-colors duration-200"
+            disabled={isExporting || files.length === 0}
+            className="h-8 text-xs font-medium"
+            title="Export clean ZIP archive"
           >
-            <Download className="w-3.5 h-3.5 text-sky-400" />
-            <span className="hidden sm:inline">Export</span>
-          </button>
-          <button
+            {isExporting ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-[#7DB9E8]" />
+            ) : (
+              <Download className="w-3.5 h-3.5 text-[#7DB9E8]" />
+            )}
+            <span className="hidden sm:inline">{isExporting ? "Exporting..." : "Export"}</span>
+          </Button>
+
+          {/* Prominent "Share Link" Copy Button */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleCopyLink}
+            className="h-8 text-xs font-semibold text-[#111111] dark:text-[#A8D8FF]"
+          >
+            <Share2 className="w-3.5 h-3.5 mr-1" />
+            <span className="hidden md:inline">Share Link</span>
+            <span className="inline md:hidden">Share</span>
+          </Button>
+
+          {/* Run Code Button */}
+          <Button
+            variant="primary"
+            size="sm"
             onClick={handleExecute}
             disabled={isExecuting || !activeFile}
-            className="flex items-center gap-1.5 px-4 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-semibold shadow-md shadow-emerald-600/20 transition-all duration-200 active:scale-95"
+            className="h-8 px-3.5 font-bold shadow-xs"
+            title="Run Code in Isolated Sandbox (Ctrl+Enter)"
           >
-            {isExecuting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5 fill-current" />}
+            {isExecuting ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Play className="w-3.5 h-3.5 fill-current" />
+            )}
             <span>Run</span>
-          </button>
+          </Button>
+
+          {/* Settings / Preferences Button */}
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => setIsSettingsModalOpen(true)}
+            title="Workspace Preferences & Shortcuts"
+            className="text-[#71717A] hover:text-[#111111] dark:hover:text-[#FFFFFF]"
+          >
+            <Settings className="w-4 h-4" />
+          </Button>
+
+          {/* ── Dynamic Top Navigation Bar (Logged In vs Guest) ───────────── */}
+          <div className="ml-1 pl-2 border-l border-[#D4D4D4] dark:border-[#27272A] flex items-center">
+            {effectiveSession?.user ? (
+              <UserAvatarNav
+                user={effectiveSession.user}
+                onOpenSettings={() => setIsSettingsModalOpen(true)}
+              />
+            ) : (
+              /* Guest: Sign In button */
+              <Link
+                href={`/login?callbackUrl=${encodeURIComponent(`/room/${roomId}`)}`}
+              >
+                <Button
+                  variant="primary"
+                  size="sm"
+                  className="h-8 px-3 text-xs font-semibold shadow-xs bg-[#A8D8FF] text-[#0A0A0A] hover:bg-[#7DB9E8]"
+                >
+                  <LogIn className="w-3.5 h-3.5 mr-1" />
+                  <span>Sign In</span>
+                </Button>
+              </Link>
+            )}
+          </div>
         </div>
       </header>
 
-      {/* ────────────────── Main Body ────────────────────────────── */}
+      {/* ────────────────── Main Workspace Grid (3-Column Layout) ────────────────── */}
       <div className="flex-1 flex overflow-hidden">
+        {/* ── Left Sidebar (File Explorer & VCS) ────────────────── */}
+        <aside className="w-64 sm:w-72 shrink-0 border-r border-[#D4D4D4] dark:border-[#27272A] bg-[#FFFFFF] dark:bg-[#000000] flex flex-col transition-colors duration-200">
+          {/* Tab Switcher between Files and Commits (VCS) */}
+          <div className="h-10 border-b border-[#D4D4D4] dark:border-[#27272A] flex items-center px-2 bg-[#F2F2F0] dark:bg-[#000000] shrink-0">
+            <button
+              onClick={() => setSidebarTab("files")}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                sidebarTab === "files"
+                  ? "bg-[#FFFFFF] dark:bg-[#181818] text-[#18181B] dark:text-[#FFFFFF] shadow-xs"
+                  : "text-[#52525B] dark:text-[#A1A1AA] hover:text-[#18181B] dark:hover:text-[#FFFFFF]"
+              }`}
+            >
+              <FolderOpen className="w-3.5 h-3.5 text-[#18181B] dark:text-[#A8D8FF]" />
+              <span>Files</span>
+              <span className="text-[10px] text-[#71717A] dark:text-[#52525B] font-mono">({files.length})</span>
+            </button>
 
-        {/* ── File Explorer Sidebar ──────────────────────────────── */}
-        <div className={`w-56 shrink-0 border-r border-zinc-800/60 transition-all duration-700 ${
-          antigravityState.active ? "antigravity-panel-sidebar" : ""
-        }`}>
-          <FileExplorer
-            files={files}
-            activeFilePath={activeFilePath}
-            onFileSelect={handleFileSelect}
-            onFileCreate={handleFileCreate}
-            onFileDelete={handleFileDelete}
-            onFileRename={handleFileRename}
-            roomTitle={roomTitle.toUpperCase()}
-          />
-        </div>
-
-        {/* ── Editor + Terminal column ───────────────────────────── */}
-        <div className="flex-1 flex flex-col min-w-0 bg-zinc-950">
-          {/* File tab bar */}
-          <div className="h-9 bg-zinc-900/60 border-b border-zinc-800/60 px-4 flex items-center justify-between text-xs text-zinc-400 shrink-0">
-            <div className="flex items-center gap-1.5">
-              {activeFile ? (
-                <span className={`px-2.5 py-1 rounded-lg bg-zinc-800/80 text-zinc-200 border border-zinc-700/50 font-mono text-[11px] flex items-center gap-1.5`}>
-                  <span className={`w-2 h-2 rounded-full ${
-                    activeLanguage === "cpp" ? "bg-indigo-400" : activeLanguage === "javascript" ? "bg-amber-400" : "bg-emerald-400"
-                  }`} />
-                  {activeFile.name}
+            <button
+              onClick={() => setSidebarTab("vcs")}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                sidebarTab === "vcs"
+                  ? "bg-[#FFFFFF] dark:bg-[#181818] text-[#18181B] dark:text-[#FFFFFF] shadow-xs"
+                  : "text-[#52525B] dark:text-[#A1A1AA] hover:text-[#18181B] dark:hover:text-[#FFFFFF]"
+              }`}
+            >
+              <History className="w-3.5 h-3.5 text-[#18181B] dark:text-[#A8D8FF]" />
+              <span>Commits</span>
+              {commits.length > 0 && (
+                <span className="text-[10px] text-[#71717A] dark:text-[#E8E1D5] font-mono">
+                  ({commits.length})
                 </span>
+              )}
+            </button>
+          </div>
+
+          {/* Left Panel View */}
+          <div className="flex-1 min-h-0 overflow-hidden">
+            {sidebarTab === "files" ? (
+              <FileExplorer
+                files={files}
+                activeFilePath={activeFilePath}
+                isOwner={isOwner}
+                onFileSelect={handleFileSelect}
+                onFileCreate={handleFileCreate}
+                onFileDelete={handleFileDelete}
+                onFileRename={handleFileRename}
+                roomTitle="Workspace Files"
+              />
+            ) : (
+              <VCSPanel
+                roomId={roomId}
+                currentFiles={files.map((f) => ({
+                  path: f.path,
+                  name: f.name,
+                  language: f.language,
+                  content: f.content,
+                }))}
+                currentCode={activeCode}
+                currentLanguage={activeLanguage}
+                currentUserName={currentUserName}
+                currentUserId={currentUserId}
+                commits={commits}
+                onCommitCreated={(newCommit) => {
+                  setCommits((prev) => {
+                    if (prev.some((c) => c.id === newCommit.id)) return prev;
+                    return [newCommit, ...prev];
+                  });
+                }}
+                onRollback={handleRollback}
+                emitCommitSnapshot={emitCommitSnapshot}
+                emitRollback={emitRollback}
+              />
+            )}
+          </div>
+        </aside>
+
+        {/* ── Center Panel (Monaco Code Editor + Tabs + Dedicated Bottom Terminal) ──── */}
+        <main className="flex-1 flex flex-col min-w-0 bg-[#FFFFFF] dark:bg-[#000000] transition-colors duration-200 overflow-hidden">
+          {/* Top Tab Bar displaying currently open files with close (×) buttons */}
+          <div className="h-10 bg-[#F2F2F0] dark:bg-[#000000] border-b border-[#D4D4D4] dark:border-[#27272A] px-2 flex items-center justify-between text-xs overflow-x-auto shrink-0 select-none">
+            <div className="flex items-center gap-1 overflow-x-auto">
+              {openFilePaths.length === 0 ? (
+                <span className="text-[#71717A] dark:text-[#52525B] text-xs px-2 italic">No files open</span>
               ) : (
-                <span className="text-zinc-600 text-[11px]">No file selected</span>
+                openFilePaths.map((path) => {
+                  const file = files.find((f) => f.path === path);
+                  if (!file) return null;
+                  const isActive = activeFilePath === path;
+                  return (
+                    <div
+                      key={path}
+                      onClick={() => setActiveFilePath(path)}
+                      className={`group flex items-center gap-2 px-3 py-1.5 rounded-t-lg text-xs font-mono cursor-pointer border-t border-x transition-all ${
+                        isActive
+                          ? "bg-[#FFFFFF] dark:bg-[#000000] text-[#18181B] dark:text-[#FFFFFF] border-[#D4D4D4] dark:border-[#27272A] border-b-2 border-b-[#7DB9E8] dark:border-b-[#A8D8FF] font-semibold shadow-xs"
+                          : "bg-[#F2F2F0]/60 dark:bg-[#111111] text-[#52525B] dark:text-[#A1A1AA] hover:text-[#18181B] dark:hover:text-[#FFFFFF] border-transparent hover:bg-[#E8E1D5]/60 dark:hover:bg-[#181818]"
+                      }`}
+                    >
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          file.language === "cpp"
+                            ? "bg-[#A8D8FF]"
+                            : file.language === "javascript"
+                            ? "bg-[#E8E1D5]"
+                            : "bg-[#34D399]"
+                        }`}
+                      />
+                      <span>{file.name}</span>
+                      <button
+                        onClick={(e) => handleCloseFileTab(path, e)}
+                        className="p-0.5 rounded text-[#71717A] hover:text-[#111111] dark:hover:text-[#FFFFFF] hover:bg-[#E8E1D5]/40 dark:hover:bg-[#27272A] transition-colors"
+                        title="Close tab"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                  );
+                })
               )}
             </div>
-            <div className="text-[11px] text-zinc-600 hidden sm:block">
-              🔌 Socket.io · Real-Time · {langLabel}
+
+            <div className="flex items-center gap-2 text-[11px] text-[#71717A] dark:text-[#52525B] pr-2 shrink-0 font-mono">
+              <span className="hidden sm:inline">Monotonic Consensus</span>
+              <span>•</span>
+              <span className="text-[#111111] dark:text-[#A8D8FF]">{langLabel}</span>
             </div>
           </div>
 
-          {/* Monaco Editor — or empty state */}
-          <div className={`flex-1 min-h-0 transition-all duration-700 ${
-            antigravityState.active ? "antigravity-panel-editor antigravity-glow-border m-2.5 rounded-2xl shadow-2xl" : ""
-          }`}>
+          {/* Monaco Editor Container */}
+          <div className="flex-1 min-h-0 bg-white dark:bg-[#0D0D10] relative">
             {activeFile ? (
               <Editor
                 height="100%"
-                theme="vs-dark"
+                theme={monacoTheme}
                 language={langFromMonaco(activeFile.language)}
                 value={activeFile.content}
                 onChange={handleCodeChange}
                 onMount={handleEditorMount}
                 options={{
-                  fontSize: 14,
-                  fontFamily: "'Fira Code', 'Cascadia Code', 'Courier New', monospace",
+                  fontSize: editorFontSize,
+                  tabSize: editorTabSize,
+                  fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Monaco, Consolas, monospace",
                   fontLigatures: true,
-                  minimap: { enabled: true },
+                  minimap: { enabled: editorMinimap },
                   automaticLayout: true,
                   scrollBeyondLastLine: false,
                   lineNumbers: "on",
@@ -806,35 +1217,48 @@ export default function Workspace({ roomId }: WorkspaceProps) {
                   cursorBlinking: "smooth",
                   smoothScrolling: true,
                   bracketPairColorization: { enabled: true },
-                  padding: { top: 12, bottom: 12 },
+                  padding: { top: 14, bottom: 14 },
                   wordWrap: "on",
                   renderLineHighlight: "gutter",
                 }}
               />
             ) : (
-              /* ── Empty state: no file selected ─────────────────── */
-              <div className="h-full flex flex-col items-center justify-center text-center px-8">
-                <div className="w-16 h-16 rounded-2xl bg-zinc-800/60 border border-zinc-700/40 flex items-center justify-center mb-5 shadow-md">
-                  <FileCode2 className="w-8 h-8 text-zinc-600" />
+              /* Empty state: No active file selected */
+              <div className="h-full flex flex-col items-center justify-center text-center p-8 bg-[#FAF9F5] dark:bg-[#0D0D10]">
+                <div className="w-16 h-16 rounded-2xl bg-white dark:bg-[#111111] border border-[#DCD6CA] dark:border-[#27272A] flex items-center justify-center mb-4 shadow-xs">
+                  <FileCode2 className="w-8 h-8 text-[#71717A] dark:text-[#52525B]" />
                 </div>
-                <h3 className="text-base font-semibold text-zinc-300 mb-2">No file open</h3>
-                <p className="text-sm text-zinc-500 leading-relaxed max-w-xs">
-                  Select a file from the explorer on the left, or create a new one to start coding.
+                <h3 className="text-base font-bold text-[#111111] dark:text-[#FFFFFF] mb-1">
+                  No active file open
+                </h3>
+                <p className="text-xs text-[#71717A] dark:text-[#A1A1AA] max-w-sm mb-5 leading-relaxed">
+                  Select a file from the explorer on the left, or create a new file to start coding and collaborating in real-time.
                 </p>
-                <button
+                <Button
+                  variant="primary"
+                  size="sm"
                   onClick={() => handleFileCreate("main.cpp", "cpp")}
-                  className="mt-5 px-4 py-2 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/30 text-indigo-300 text-xs font-medium transition-colors duration-200"
                 >
-                  + Create main.cpp
-                </button>
+                  <span>+ Create main.cpp</span>
+                </Button>
               </div>
             )}
           </div>
 
-          {/* Terminal Panel */}
-          <div className={`transition-all duration-700 ${
-            antigravityState.active ? "antigravity-panel-terminal m-2.5 rounded-2xl" : ""
-          }`}>
+          {/* ── Dedicated Bottom Terminal / Output Panel ───── */}
+          <div
+            style={{ height: isTerminalOpen ? `${terminalHeight}px` : "36px" }}
+            className="shrink-0 border-t border-[#DCD6CA] dark:border-[#27272A] flex flex-col transition-[height] duration-150 relative bg-white dark:bg-[#0A0A0A]"
+          >
+            {/* Resizing Drag Handle */}
+            {isTerminalOpen && (
+              <div
+                onMouseDown={handleMouseDownResize}
+                className="absolute top-0 left-0 right-0 h-1.5 -translate-y-1/2 cursor-ns-resize hover:bg-[#A8D8FF]/40 transition-colors z-30"
+                title="Drag to resize terminal panel"
+              />
+            )}
+
             <TerminalPanel
               isOpen={isTerminalOpen}
               onToggle={() => setIsTerminalOpen(!isTerminalOpen)}
@@ -847,175 +1271,378 @@ export default function Workspace({ roomId }: WorkspaceProps) {
               daemonActive={daemonActive}
             />
           </div>
-        </div>
+        </main>
 
-        {/* ── Right Sidebar ──────────────────────────────────────── */}
-        <aside className={`w-80 border-l border-zinc-800/60 bg-zinc-900/60 flex flex-col shrink-0 transition-all duration-700 ${
-          antigravityState.active ? "antigravity-panel-sidebar antigravity-glow-border m-2.5 rounded-2xl overflow-hidden shadow-2xl" : ""
-        }`}>
-          {/* Tabs */}
-          <div className="h-10 border-b border-zinc-800/60 flex items-center px-2 bg-zinc-900/40 shrink-0">
-            <button
-              onClick={() => setActiveTab("chat")}
-              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-xl text-xs font-semibold transition-all duration-200 ${
-                activeTab === "chat" ? "bg-zinc-800 text-white shadow-sm" : "text-zinc-400 hover:text-zinc-200"
-              }`}
-            >
-              <MessageSquare className="w-3.5 h-3.5 text-indigo-400" />
-              Discussion
+        {/* ── Right-hand Sidebar (Strictly In-Room Discussion Chat) ───────────────── */}
+        <aside className="w-80 sm:w-96 border-l border-[#DCD6CA] dark:border-[#27272A] bg-white dark:bg-[#111111] flex flex-col shrink-0 transition-colors duration-200">
+          {/* Discussion Header */}
+          <div className="h-10 border-b border-[#DCD6CA] dark:border-[#27272A] flex items-center justify-between px-3 bg-[#F5F3EE]/40 dark:bg-[#0A0A0A] shrink-0 select-none">
+            <div className="flex items-center gap-2">
+              <MessageSquare className="w-4 h-4 text-[#0A0A0A] dark:text-[#A8D8FF]" />
+              <span className="text-xs font-bold text-[#111111] dark:text-[#FFFFFF]">Discussion Chat</span>
               {messages.length > 0 && (
-                <span className="ml-1 px-1.5 rounded-full bg-indigo-950 text-indigo-300 text-[10px] border border-indigo-800/40">
+                <span className="px-1.5 py-0.5 rounded-full bg-[#E8E1D5]/50 dark:bg-[#18181B] text-[#111111] dark:text-[#E8E1D5] text-[10px] font-mono border border-[#DCD6CA] dark:border-[#27272A]">
                   {messages.length}
                 </span>
               )}
-            </button>
-            <button
-              onClick={() => setActiveTab("vcs")}
-              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-xl text-xs font-semibold transition-all duration-200 ${
-                activeTab === "vcs" ? "bg-zinc-800 text-white shadow-sm" : "text-zinc-400 hover:text-zinc-200"
-              }`}
-            >
-              <History className="w-3.5 h-3.5 text-violet-400" />
-              Snapshots
-              {commits.length > 0 && (
-                <span className="ml-1 px-1.5 rounded-full bg-violet-950 text-violet-300 text-[10px] border border-violet-800/40">
-                  {commits.length}
-                </span>
-              )}
-            </button>
+            </div>
+            <span className="text-[10px] text-[#71717A] dark:text-[#52525B] font-mono">Consensus Live</span>
           </div>
 
-          {/* Discussion Tab */}
-          {activeTab === "chat" && (
-            <div className="flex-1 flex flex-col min-h-0">
-              <div className="flex-1 p-3 overflow-y-auto space-y-3">
-                {messages.length === 0 ? (
-                  <div className="h-full flex flex-col items-center justify-center text-center p-6 min-h-[200px]">
-                    <div className="w-12 h-12 rounded-2xl bg-zinc-800/60 border border-zinc-700/40 flex items-center justify-center mb-3">
-                      <MessageSquare className="w-5 h-5 text-zinc-600" />
-                    </div>
-                    <p className="text-xs font-semibold text-zinc-400">Start a conversation</p>
-                    <p className="text-[11px] text-zinc-600 mt-1 leading-relaxed">
-                      Messages are broadcast to everyone in the room in real-time.
-                    </p>
+          {/* Real-time Discussion Chat Messages */}
+          <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+            <div className="flex-1 p-3.5 overflow-y-auto space-y-3.5 bg-[#FAF9F5]/40 dark:bg-[#0A0A0A]/60">
+              {messages.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-center p-6 min-h-[220px]">
+                  <div className="w-12 h-12 rounded-2xl bg-white dark:bg-[#18181B] border border-[#DCD6CA] dark:border-[#27272A] flex items-center justify-center mb-3 shadow-xs">
+                    <MessageSquare className="w-5 h-5 text-[#A8D8FF]" />
                   </div>
-                ) : (
-                  messages.map((msg) => {
-                    const isSelf = (msg.senderId && msg.senderId === currentUserId) || (msg.userId && msg.userId === currentUserId);
-                    const displayName = msg.senderName || (isSelf ? "You" : "Collaborator");
-                    return (
-                      <div key={msg.id} className={`flex flex-col text-xs ${isSelf ? "items-end" : "items-start"}`}>
-                        {/* Name of user shown directly above the chat message */}
-                        <div className={`flex items-center gap-1.5 mb-1 px-1 ${isSelf ? "flex-row-reverse" : "flex-row"}`}>
-                          <span className={`text-[11px] font-semibold tracking-tight ${isSelf ? "text-indigo-300" : "text-violet-300"}`}>
-                            {displayName} {isSelf && <span className="text-[10px] text-zinc-500 font-normal">(You)</span>}
-                          </span>
-                          <span className="text-[10px] text-zinc-500">
-                            {typeof msg.createdAt === "string" && msg.createdAt.includes("T")
-                              ? new Date(msg.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-                              : msg.createdAt}
-                          </span>
-                        </div>
-                        <div
-                          className={`p-2.5 rounded-2xl text-zinc-200 leading-relaxed break-words max-w-[90%] text-[12px] shadow-sm ${
+                  <p className="text-xs font-bold text-[#111111] dark:text-[#FFFFFF]">
+                    In-Room Discussion Chat
+                  </p>
+                  <p className="text-[11px] text-[#71717A] dark:text-[#A1A1AA] mt-1 leading-relaxed max-w-[220px]">
+                    Send questions, code ideas, or snippets. All collaborators in this room receive updates instantly.
+                  </p>
+                </div>
+              ) : (
+                messages.map((msg) => {
+                  const isSelf =
+                    (msg.senderId && msg.senderId === currentUserId) ||
+                    (msg.userId && msg.userId === currentUserId);
+                  const displayName = msg.senderName || (isSelf ? "You" : "Collaborator");
+                  return (
+                    <div
+                      key={msg.id}
+                      className={`flex flex-col text-xs ${isSelf ? "items-end" : "items-start"}`}
+                    >
+                      {/* Name of user shown directly above chat message */}
+                      <div
+                        className={`flex items-center gap-1.5 mb-1 px-1 ${
+                          isSelf ? "flex-row-reverse" : "flex-row"
+                        }`}
+                      >
+                        <span
+                          className={`text-[11px] font-bold tracking-tight ${
                             isSelf
-                              ? "bg-indigo-900/50 border border-indigo-700/40 rounded-tr-none text-indigo-100"
-                              : "bg-zinc-800/80 border border-zinc-700/60 rounded-tl-none text-zinc-100"
+                              ? "text-[#0A0A0A] dark:text-[#A8D8FF]"
+                              : "text-[#71717A] dark:text-[#E8E1D5]"
                           }`}
                         >
-                          {msg.content}
-                        </div>
+                          {displayName}{" "}
+                          {isSelf && (
+                            <span className="text-[10px] text-[#71717A] dark:text-[#52525B] font-normal font-mono">(You)</span>
+                          )}
+                        </span>
+                        <span className="text-[10px] text-[#71717A] dark:text-[#52525B] font-mono">
+                          {typeof msg.createdAt === "string" && msg.createdAt.includes("T")
+                            ? new Date(msg.createdAt).toLocaleTimeString([], {
+                                hour: "2-digit",
+                                minute: "2-digit",
+                              })
+                            : msg.createdAt}
+                        </span>
                       </div>
-                    );
-                  })
-                )}
-                <div ref={messagesEndRef} />
-              </div>
-              <form onSubmit={handleSendMessage} className="p-3 border-t border-zinc-800/60 bg-zinc-950/60 shrink-0">
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={inputMessage}
-                    onChange={(e) => setInputMessage(e.target.value)}
-                    placeholder="Message all collaborators…"
-                    className="flex-1 px-3 py-2 bg-zinc-800/60 border border-zinc-700/60 rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 transition-colors duration-200"
-                  />
-                  <button type="submit" className="p-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white transition-colors duration-200 shrink-0">
-                    <Send className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </form>
+
+                      {/* Chat bubble */}
+                      <div
+                        className={`p-3 rounded-xl leading-relaxed break-words max-w-[90%] text-xs shadow-xs ${
+                          isSelf
+                            ? "bg-[#18181B] text-[#FFFFFF] border border-[#27272A] rounded-tr-none font-medium"
+                            : "bg-[#FFFFFF] dark:bg-[#111111] text-[#18181B] dark:text-[#E8E1D5] border border-[#D4D4D4] dark:border-[#27272A] rounded-tl-none"
+                        }`}
+                      >
+                        {msg.content}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+              <div ref={messagesEndRef} />
             </div>
-          )}
 
-          {/* Snapshots / VCS Tab */}
-          {activeTab === "vcs" && (
-            <VCSPanel
-              roomId={roomId}
-              currentFiles={files.map((f) => ({ path: f.path, name: f.name, language: f.language, content: f.content }))}
-              currentCode={activeCode}
-              currentLanguage={activeLanguage}
-              currentUserName={currentUserName}
-              currentUserId={currentUserId}
-              commits={commits}
-              onCommitCreated={(newCommit) => {
-                setCommits((prev) => {
-                  if (prev.some((c) => c.id === newCommit.id)) return prev;
-                  return [newCommit, ...prev];
-                });
-                showNotification(`Snapshot: "${newCommit.message}" saved`, "success");
-              }}
-              onRollback={handleRollback}
-              emitCommitSnapshot={emitCommitSnapshot}
-              emitRollback={emitRollback}
-            />
-          )}
-        </aside>
-      </div>
-
-      {/* ────────────────── Commit Modal ─────────────────────────── */}
-      {isCommitModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-zinc-900 border border-zinc-700/60 rounded-2xl w-full max-w-md p-6 shadow-2xl shadow-zinc-950/50">
-            <h3 className="text-base font-bold text-white mb-1 flex items-center gap-2">
-              <GitCommit className="w-4 h-4 text-violet-400" />
-              Save Version Snapshot
-            </h3>
-            <p className="text-xs text-zinc-400 mb-4 leading-relaxed">
-              Saves a snapshot of <strong className="text-zinc-300">all {files.length} file{files.length !== 1 ? "s" : ""}</strong> in the workspace. All collaborators will see the new commit in the history panel.
-            </p>
-            <form onSubmit={handleSaveCommit} className="space-y-4">
-              <div>
-                <label className="block text-xs font-medium text-zinc-300 mb-1.5">Commit Message</label>
-                <input
+            {/* Auto-expanding Chat Input */}
+            <form
+              onSubmit={handleSendMessage}
+              className="p-3 border-t border-[#D4D4D4] dark:border-[#27272A] bg-[#FFFFFF] dark:bg-[#000000] shrink-0"
+            >
+              <div className="flex items-center gap-2">
+                <Input
                   type="text"
-                  required
-                  autoFocus
-                  value={commitMessage}
-                  onChange={(e) => setCommitMessage(e.target.value)}
-                  placeholder="e.g. Implement BFS traversal with adjacency list"
-                  className="w-full px-3.5 py-2.5 bg-zinc-800 border border-zinc-700 rounded-xl text-sm text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors duration-200"
+                  value={inputMessage}
+                  onChange={(e) => setInputMessage(e.target.value)}
+                  placeholder="Message peers in room…"
+                  className="flex-1 h-9 text-xs bg-[#FFFFFF] dark:bg-[#111111] border-[#D4D4D4] dark:border-[#27272A] text-[#18181B] dark:text-[#F5F5F5]"
                 />
-              </div>
-              <div className="flex items-center justify-end gap-2.5 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setIsCommitModalOpen(false)}
-                  className="px-4 py-2 rounded-xl text-xs font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors duration-200"
-                >
-                  Cancel
-                </button>
-                <button
+                <Button
                   type="submit"
-                  className="px-4 py-2 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold shadow-md shadow-violet-600/20 transition-all duration-200"
+                  variant="primary"
+                  size="icon-sm"
+                  className="shrink-0 bg-[#A8D8FF] text-[#0A0A0A] hover:bg-[#7DB9E8]"
+                  title="Send message"
                 >
-                  Save Snapshot
-                </button>
+                  <Send className="w-3.5 h-3.5" />
+                </Button>
               </div>
             </form>
           </div>
-        </div>
-      )}
+        </aside>
+      </div>
+
+      {/* ────────────────── Commit Snapshot Modal (Dialog Primitive) ───────────────────── */}
+      <Dialog open={isCommitModalOpen} onOpenChange={setIsCommitModalOpen}>
+        <DialogContent onClose={() => setIsCommitModalOpen(false)}>
+          <DialogHeader
+            title="Save Version Snapshot"
+            description={`Captures an immutable snapshot of all ${files.length} file${
+              files.length !== 1 ? "s" : ""
+            } in the workspace. All peers will be notified and can roll back to this revision anytime.`}
+          />
+          <form onSubmit={handleSaveCommit} className="space-y-4">
+            <div>
+              <label className="block text-xs font-medium text-[#111111] dark:text-[#F5F3EE] mb-1.5">
+                Commit Message
+              </label>
+              <Input
+                type="text"
+                required
+                autoFocus
+                value={commitMessage}
+                onChange={(e) => setCommitMessage(e.target.value)}
+                placeholder="e.g. Implement BFS traversal with adjacency list"
+                className="h-10 text-xs font-mono"
+              />
+            </div>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setIsCommitModalOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                variant="primary"
+                size="sm"
+                disabled={isSavingCommit || !commitMessage.trim()}
+              >
+                {isSavingCommit ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin mr-1" />
+                ) : (
+                  <GitCommit className="w-3.5 h-3.5 mr-1" />
+                )}
+                <span>{isSavingCommit ? "Saving..." : "Save Snapshot"}</span>
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* ────────────────── Royal Settings & Preferences Modal ───────────────────── */}
+      <Dialog open={isSettingsModalOpen} onOpenChange={setIsSettingsModalOpen}>
+        <DialogContent className="max-w-xl" onClose={() => setIsSettingsModalOpen(false)}>
+          <DialogHeader
+            title="Workspace Preferences"
+            description="Configure runtime editor ergonomics, visual appearance, and keyboard bindings."
+          />
+
+          {/* Settings Tabs */}
+          <div className="flex items-center gap-1 p-1 bg-[#E8E1D5]/40 dark:bg-[#18181B] rounded-lg border border-[#DCD6CA] dark:border-[#27272A] mb-4 text-xs font-semibold">
+            <button
+              type="button"
+              onClick={() => setSettingsTab("editor")}
+              className={`flex-1 py-1.5 rounded-md text-center transition-all cursor-pointer ${
+                settingsTab === "editor"
+                  ? "bg-white dark:bg-[#0A0A0A] text-[#111111] dark:text-[#FFFFFF] shadow-xs"
+                  : "text-[#71717A] dark:text-[#A1A1AA] hover:text-[#111111] dark:hover:text-[#FFFFFF]"
+              }`}
+            >
+              Editor
+            </button>
+            <button
+              type="button"
+              onClick={() => setSettingsTab("appearance")}
+              className={`flex-1 py-1.5 rounded-md text-center transition-all cursor-pointer ${
+                settingsTab === "appearance"
+                  ? "bg-white dark:bg-[#0A0A0A] text-[#111111] dark:text-[#FFFFFF] shadow-xs"
+                  : "text-[#71717A] dark:text-[#A1A1AA] hover:text-[#111111] dark:hover:text-[#FFFFFF]"
+              }`}
+            >
+              Appearance
+            </button>
+            <button
+              type="button"
+              onClick={() => setSettingsTab("shortcuts")}
+              className={`flex-1 py-1.5 rounded-md text-center transition-all cursor-pointer ${
+                settingsTab === "shortcuts"
+                  ? "bg-white dark:bg-[#0A0A0A] text-[#111111] dark:text-[#FFFFFF] shadow-xs"
+                  : "text-[#71717A] dark:text-[#A1A1AA] hover:text-[#111111] dark:hover:text-[#FFFFFF]"
+              }`}
+            >
+              Shortcuts
+            </button>
+            <button
+              type="button"
+              onClick={() => setSettingsTab("account")}
+              className={`flex-1 py-1.5 rounded-md text-center transition-all cursor-pointer ${
+                settingsTab === "account"
+                  ? "bg-white dark:bg-[#0A0A0A] text-[#111111] dark:text-[#FFFFFF] shadow-xs"
+                  : "text-[#71717A] dark:text-[#A1A1AA] hover:text-[#111111] dark:hover:text-[#FFFFFF]"
+              }`}
+            >
+              Account
+            </button>
+          </div>
+
+          {/* TAB: Editor */}
+          {settingsTab === "editor" && (
+            <div className="space-y-4 py-1">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-xs font-semibold text-[#111111] dark:text-[#F5F3EE]">Editor Font Size</div>
+                  <div className="text-[11px] text-[#71717A] dark:text-[#A1A1AA]">Adjust Monaco code typography scaling</div>
+                </div>
+                <div className="flex items-center gap-1">
+                  {[12, 13, 14, 16].map((size) => (
+                    <button
+                      key={size}
+                      onClick={() => setEditorFontSize(size)}
+                      className={`px-2.5 py-1 rounded-md text-xs font-mono transition-all cursor-pointer ${
+                        editorFontSize === size
+                          ? "bg-[#A8D8FF] text-[#0A0A0A] font-bold"
+                          : "bg-[#E8E1D5]/40 dark:bg-[#18181B] text-[#71717A] dark:text-[#A1A1AA] hover:text-[#111111] dark:hover:text-[#FFFFFF]"
+                      }`}
+                    >
+                      {size}px
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between border-t border-[#DCD6CA] dark:border-[#27272A] pt-3">
+                <div>
+                  <div className="text-xs font-semibold text-[#111111] dark:text-[#F5F3EE]">Code Minimap</div>
+                  <div className="text-[11px] text-[#71717A] dark:text-[#A1A1AA]">Display high-level code minimap in editor gutter</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setEditorMinimap(!editorMinimap)}
+                  className={`w-11 h-6 rounded-full transition-colors relative cursor-pointer ${
+                    editorMinimap ? "bg-[#A8D8FF]" : "bg-[#27272A]"
+                  }`}
+                >
+                  <span
+                    className={`block w-4 h-4 rounded-full bg-[#0A0A0A] transition-transform absolute top-1 ${
+                      editorMinimap ? "left-6" : "left-1"
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <div className="flex items-center justify-between border-t border-[#DCD6CA] dark:border-[#27272A] pt-3">
+                <div>
+                  <div className="text-xs font-semibold text-[#111111] dark:text-[#F5F3EE]">Indentation Tab Size</div>
+                  <div className="text-[11px] text-[#71717A] dark:text-[#A1A1AA]">Number of spaces per indentation level</div>
+                </div>
+                <div className="flex items-center gap-1">
+                  {[2, 4].map((tab) => (
+                    <button
+                      key={tab}
+                      onClick={() => setEditorTabSize(tab)}
+                      className={`px-2.5 py-1 rounded-md text-xs font-mono transition-all cursor-pointer ${
+                        editorTabSize === tab
+                          ? "bg-[#A8D8FF] text-[#0A0A0A] font-bold"
+                          : "bg-[#E8E1D5]/40 dark:bg-[#18181B] text-[#71717A] dark:text-[#A1A1AA]"
+                      }`}
+                    >
+                      {tab} spaces
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB: Appearance */}
+          {settingsTab === "appearance" && (
+            <div className="space-y-4 py-1">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-xs font-semibold text-[#111111] dark:text-[#F5F3EE]">Theme Mode</div>
+                  <div className="text-[11px] text-[#71717A] dark:text-[#A1A1AA]">Royal Dark or Royal Daylight color system</div>
+                </div>
+                <ThemeToggle showLabel />
+              </div>
+
+              <div className="border-t border-[#DCD6CA] dark:border-[#27272A] pt-3">
+                <div className="text-xs font-semibold text-[#111111] dark:text-[#F5F3EE] mb-1">Typography Architecture</div>
+                <div className="text-[11px] text-[#71717A] dark:text-[#A1A1AA] leading-relaxed">
+                  Headings and UI powered by <strong className="text-[#111111] dark:text-[#F5F3EE]">Plus Jakarta Sans</strong>, metadata with <strong className="text-[#111111] dark:text-[#F5F3EE]">Inter</strong>, code and terminals with <strong className="text-[#111111] dark:text-[#F5F3EE]">JetBrains Mono</strong>.
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB: Shortcuts */}
+          {settingsTab === "shortcuts" && (
+            <div className="space-y-2 py-1 font-mono text-xs">
+              <div className="flex items-center justify-between p-2 rounded-lg bg-[#E8E1D5]/25 dark:bg-[#18181B] border border-[#DCD6CA] dark:border-[#27272A]">
+                <span className="text-[#111111] dark:text-[#F5F3EE]">Run Code in Sandbox</span>
+                <span className="px-2 py-0.5 rounded bg-white dark:bg-[#0A0A0A] border border-[#DCD6CA] dark:border-[#27272A] text-[#0A0A0A] dark:text-[#A8D8FF] font-bold">
+                  Ctrl / ⌘ + Enter
+                </span>
+              </div>
+              <div className="flex items-center justify-between p-2 rounded-lg bg-[#E8E1D5]/25 dark:bg-[#18181B] border border-[#DCD6CA] dark:border-[#27272A]">
+                <span className="text-[#111111] dark:text-[#F5F3EE]">Save Version Snapshot</span>
+                <span className="px-2 py-0.5 rounded bg-white dark:bg-[#0A0A0A] border border-[#DCD6CA] dark:border-[#27272A] text-[#0A0A0A] dark:text-[#A8D8FF] font-bold">
+                  Ctrl / ⌘ + S
+                </span>
+              </div>
+              <div className="flex items-center justify-between p-2 rounded-lg bg-[#E8E1D5]/25 dark:bg-[#18181B] border border-[#DCD6CA] dark:border-[#27272A]">
+                <span className="text-[#111111] dark:text-[#F5F3EE]">Close Dialog / Drawer</span>
+                <span className="px-2 py-0.5 rounded bg-white dark:bg-[#0A0A0A] border border-[#DCD6CA] dark:border-[#27272A] text-[#71717A] dark:text-[#A1A1AA] font-bold">
+                  Escape
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* TAB: Account */}
+          {settingsTab === "account" && (
+            <div className="space-y-3 py-1 text-xs">
+              <div className="flex items-center gap-3 p-3 rounded-lg bg-[#E8E1D5]/25 dark:bg-[#18181B] border border-[#DCD6CA] dark:border-[#27272A]">
+                <div className="w-10 h-10 rounded-full bg-[#18181B] dark:bg-[#27272A] text-[#A8D8FF] border border-[#27272A] flex items-center justify-center text-sm font-bold">
+                  {(effectiveSession?.user?.name?.[0] || "U").toUpperCase()}
+                </div>
+                <div>
+                  <div className="font-bold text-[#111111] dark:text-[#FFFFFF]">
+                    {effectiveSession?.user?.name || "Anonymous Developer"}
+                  </div>
+                  <div className="text-[11px] text-[#71717A] dark:text-[#A1A1AA] font-mono">
+                    {effectiveSession?.user?.email || "Guest Session"}
+                  </div>
+                </div>
+              </div>
+
+              <div className="text-[11px] text-[#71717A] dark:text-[#A1A1AA]">
+                Session ID: <span className="font-mono text-[#111111] dark:text-[#E8E1D5]">{currentUserId}</span>
+              </div>
+            </div>
+          )}
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="primary"
+              size="sm"
+              onClick={() => setIsSettingsModalOpen(false)}
+            >
+              Done
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

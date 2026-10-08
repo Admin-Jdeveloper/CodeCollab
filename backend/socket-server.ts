@@ -2,39 +2,66 @@ import express from "express";
 import { createServer } from "node:http";
 import { Server, type Socket } from "socket.io";
 import cors from "cors";
+import { createAdapter } from "@socket.io/redis-adapter";
 import { prisma } from "./db";
+import { createRedisClient } from "./redis";
+import { ExecutionRateLimiter } from "./execution/rateLimiter";
 
 // ============================================================
 // TYPES
 // ============================================================
 
-/** In-memory state for a single file within a room */
-interface FileState {
+export interface FileState {
+  id: string;
+  path: string;
+  name: string;
   content: string;
   language: string;
+  version: number;
+  updatedAt: Date;
+  updatedBy?: string;
 }
 
 /** Per-room cache: filePath → FileState */
-type RoomFileCache = Map<string, FileState>;
+export type RoomFileCache = Map<string, FileState>;
 
-interface UserMeta {
+export interface UserMeta {
+  socketId: string;
   userId: string;
   userName: string;
   roomId: string;
   color: string;
+  currentFilePath?: string;
+  cursor?: { lineNumber: number; column: number };
 }
 
-// ── Socket payloads ──────────────────────────────────────────────────────────
+// ── Socket Payloads ──────────────────────────────────────────
 
-interface CodeChangePayload {
+export interface CodeChangePayload {
   roomId: string;
-  filePath: string; // e.g. "/main.cpp" — scopes edits to a specific file
-  code: string;
+  fileId?: string;
+  filePath: string;
+  version: number;
+  content?: string;
+  code?: string;
   senderId: string;
   language?: string;
 }
 
-interface ChatPayload {
+export interface CursorPayload {
+  roomId: string;
+  fileId?: string;
+  filePath: string;
+  cursor: { lineNumber: number; column: number };
+  selection?: {
+    startLineNumber: number;
+    startColumn: number;
+    endLineNumber: number;
+    endColumn: number;
+  };
+}
+
+export interface ChatPayload {
   roomId: string;
   senderId: string;
   senderName: string;
@@ -42,36 +69,31 @@ interface ChatPayload {
   msgId: string;
 }
 
-interface LanguagePayload {
+export interface LanguagePayload {
   roomId: string;
   filePath: string;
   language: string;
   senderId: string;
 }
 
-interface CommitPayload {
+export interface CommitPayload {
   roomId: string;
   message: string;
-  // Legacy single-file fields (optional — multi-file payload preferred)
   code?: string;
   language?: string;
-  // Multi-file snapshot
   filesSnapshot?: Array<{ path: string; name: string; language: string; content: string }>;
   userId?: string;
   authorName: string;
 }
 
-interface RollbackPayload {
+export interface RollbackPayload {
   roomId: string;
   commitId: string;
-  requestedBy?: string; // userName of who triggered it (for logging)
+  requestedBy?: string;
 }
 
 // ============================================================
-// IN-MEMORY STATE
-// roomFileCache:  roomId → Map<filePath, FileState>
-// roomUsers:      roomId → Map<socketId, UserMeta>
-// dbSaveTimers:   roomId → debounce timer handle
+// IN-MEMORY STATE & CONSTANTS
 // ============================================================
 
 const roomFileCache = new Map<string, RoomFileCache>();
@@ -91,19 +113,31 @@ function getColorForSocket(roomId: string, socketId: string): string {
 }
 
 // ============================================================
-// EXPRESS + HTTP SERVER + SOCKET.IO
+// EXPRESS + HTTP SERVER + SOCKET.IO SETUP
 // ============================================================
 
 const app = express();
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
+// ── Liveness probe
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     activeRooms: roomFileCache.size,
     totalConnectedUsers: Array.from(roomUsers.values()).reduce((s, m) => s + m.size, 0),
+    timestamp: new Date().toISOString(),
   });
+});
+
+// ── Readiness probe
+app.get("/ready", async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ status: "ready", database: "connected" });
+  } catch (err: any) {
+    res.status(503).json({ status: "not_ready", error: err.message });
+  }
 });
 
 const httpServer = createServer(app);
@@ -115,94 +149,424 @@ const io = new Server(httpServer, {
   pingInterval: 25000,
 });
 
+// ── Redis Pub/Sub Adapter for Horizontal Scaling ─────────────
+const pubClient = createRedisClient("socket-pub");
+const subClient = createRedisClient("socket-sub");
+const execEventsClient = createRedisClient("exec-events-sub");
+const socketRateLimiter = new ExecutionRateLimiter(pubClient);
+
+// Connection Rate Limiter Middleware
+io.use(async (socket, next) => {
+  const clientIp = socket.handshake.address || socket.id;
+  const check = await socketRateLimiter.checkSocketConnection(clientIp);
+  if (!check.allowed) {
+    return next(new Error(check.reason || "Rate limit exceeded"));
+  }
+  next();
+});
+
+try {
+  io.adapter(createAdapter(pubClient, subClient));
+  console.log("[Socket.IO] Redis adapter initialized successfully");
+} catch (err: any) {
+  console.warn("[Socket.IO] Redis adapter init warning (fallback to memory):", err.message);
+}
+
+// ── Listen to execution events published by BullMQ workers ──
+execEventsClient.subscribe("execution-events", (err) => {
+  if (err) {
+    console.error("[Socket.IO] Failed to subscribe to execution-events channel:", err.message);
+  } else {
+    console.log("[Socket.IO] Subscribed to execution-events Redis channel");
+  }
+});
+
+execEventsClient.on("message", (channel, message) => {
+  if (channel === "execution-events") {
+    try {
+      const event = JSON.parse(message);
+      const { roomId, eventType, data } = event;
+      if (roomId) {
+        const targetUserId = data?.userId;
+        const usersInRoom = roomUsers.get(roomId);
+        let deliveredToUser = false;
+
+        // If target userId is known, deliver specifically to that user's socket(s)
+        if (targetUserId && usersInRoom) {
+          for (const user of usersInRoom.values()) {
+            if (user.userId === targetUserId) {
+              io.to(user.socketId).emit("execution_event", { eventType, ...data });
+              io.to(user.socketId).emit(eventType, data);
+              deliveredToUser = true;
+            }
+          }
+        }
+
+        // Only broadcast as fallback if specific user was not found
+        if (!deliveredToUser) {
+          io.to(roomId).emit("execution_event", { eventType, ...data });
+          io.to(roomId).emit(eventType, data);
+        }
+      }
+    } catch (e: any) {
+      console.error("[Socket.IO] Failed to parse execution event message:", e.message);
+    }
+  }
+});
+
+// ============================================================
+// ROOM HYDRATION HELPER
+// ============================================================
+
+async function ensureRoomHydrated(roomId: string): Promise<RoomFileCache> {
+  let fileCache = roomFileCache.get(roomId);
+  if (!fileCache) {
+    fileCache = new Map();
+    try {
+      let room = await prisma.room.findUnique({
+        where: { id: roomId },
+        include: { files: { orderBy: { createdAt: "asc" } } },
+      });
+
+      if (!room) {
+        try {
+          room = await prisma.room.create({
+            data: {
+              id: roomId,
+              title: "Room " + roomId.slice(0, 8),
+              language: "javascript",
+              code: '// Welcome to CodeCollab!\n',
+            },
+            include: { files: { orderBy: { createdAt: "asc" } } },
+          });
+        } catch {
+          room = await prisma.room.findUnique({
+            where: { id: roomId },
+            include: { files: { orderBy: { createdAt: "asc" } } },
+          });
+        }
+      }
+
+      if (room) {
+        if (room.files.length > 0) {
+          for (const f of room.files) {
+            fileCache.set(f.path, {
+              id: f.id,
+              path: f.path,
+              name: f.name,
+              content: f.content,
+              language: f.language,
+              version: f.version || 1,
+              updatedAt: f.updatedAt,
+            });
+          }
+        } else {
+          // Seed initial file
+          const defaultPath = `/main.${room.language === "javascript" ? "js" : room.language === "python" ? "py" : "cpp"}`;
+          const initialFile = await prisma.file.create({
+            data: {
+              roomId,
+              path: defaultPath,
+              name: defaultPath.slice(1),
+              content: room.code,
+              language: room.language,
+              version: 1,
+            },
+          });
+          fileCache.set(defaultPath, {
+            id: initialFile.id,
+            path: initialFile.path,
+            name: initialFile.name,
+            content: initialFile.content,
+            language: initialFile.language,
+            version: initialFile.version,
+            updatedAt: initialFile.updatedAt,
+          });
+        }
+      }
+    } catch (err) {
+      console.error(`[DB] Failed to hydrate room ${roomId}:`, err);
+    }
+    roomFileCache.set(roomId, fileCache);
+  }
+  return fileCache;
+}
+
 // ============================================================
 // SOCKET.IO EVENT HANDLERS
 // ============================================================
 
 io.on("connection", (socket: Socket) => {
-  console.log(`[Socket] Client connected: ${socket.id}`);
-
   // ----------------------------------------------------------
   // JOIN ROOM
-  // Payload: { roomId, userId, userName }
+  // Payload: { roomId, userId, userName, lastKnownVersions? }
   // ----------------------------------------------------------
-  socket.on("join_room", async ({ roomId, userId, userName }: { roomId: string; userId: string; userName: string }) => {
-    socket.join(roomId);
-    console.log(`[Room] ${userName} (${socket.id}) joined room: ${roomId}`);
-
-    if (!roomUsers.has(roomId)) roomUsers.set(roomId, new Map());
-    const color = getColorForSocket(roomId, socket.id);
-    roomUsers.get(roomId)!.set(socket.id, { userId, userName, roomId, color });
-
-    // Load or hydrate file cache from DB
-    if (!roomFileCache.has(roomId)) {
-      try {
-        const room = await prisma.room.findUnique({
-          where: { id: roomId },
-          include: { files: { orderBy: { createdAt: "asc" } } },
-        });
-
-        if (room) {
-          const fileCache: RoomFileCache = new Map();
-          if (room.files.length > 0) {
-            for (const f of room.files) {
-              fileCache.set(f.path, { content: f.content, language: f.language });
-            }
-          } else {
-            // No files yet — seed from legacy code field
-            const defaultPath = `/main.${room.language === "javascript" ? "js" : room.language === "python" ? "py" : "cpp"}`;
-            fileCache.set(defaultPath, { content: room.code, language: room.language });
-          }
-          roomFileCache.set(roomId, fileCache);
-        }
-      } catch (err) {
-        console.error(`[DB] Failed to load room ${roomId}:`, err);
-      }
-    }
-
-    // Send current file states to the joining user only
-    const fileCache = roomFileCache.get(roomId);
-    if (fileCache) {
-      const files = Array.from(fileCache.entries()).map(([path, state]) => ({
-        path,
-        content: state.content,
-        language: state.language,
-      }));
-      socket.emit("room_state", { roomId, files });
-    }
-
-    broadcastPresence(roomId);
-    socket.to(roomId).emit("user_joined", { userId, userName, socketId: socket.id, color });
-  });
-
-  // ----------------------------------------------------------
-  // FILE-SCOPED CODE CHANGE SYNC
-  // Payload: { roomId, filePath, code, senderId, language? }
-  // Only peers viewing the SAME file will apply the change.
-  // ----------------------------------------------------------
-  socket.on("code_change", ({ roomId, filePath, code, senderId, language }: CodeChangePayload) => {
-    // Guard: ignore empty payloads
-    if (!filePath) {
-      console.warn(`[Socket] code_change received without filePath from ${socket.id} — ignored`);
+  socket.on("join_room", async ({
+    roomId,
+    userId,
+    userName,
+    lastKnownVersions,
+  }: {
+    roomId: string;
+    userId: string;
+    userName: string;
+    lastKnownVersions?: Record<string, number>;
+  }) => {
+    if (!roomId) return;
+    const rateCheck = await socketRateLimiter.checkJoinRoom(userId || socket.id);
+    if (!rateCheck.allowed) {
+      socket.emit("rate_limit_exceeded", { error: rateCheck.reason });
       return;
     }
 
-    // Update hot cache for this specific file
-    const fileCache = roomFileCache.get(roomId) ?? new Map<string, FileState>();
-    const existing = fileCache.get(filePath) ?? { content: "", language: language ?? "cpp" };
-    fileCache.set(filePath, { content: code, language: language ?? existing.language });
-    roomFileCache.set(roomId, fileCache);
+    socket.join(roomId);
+    socket.join(`room:${roomId}`);
 
-    // Broadcast to peers — includes filePath so each client only applies it to the right editor
-    socket.to(roomId).emit("code_update", { filePath, code, senderId, roomId });
+    if (!roomUsers.has(roomId)) roomUsers.set(roomId, new Map());
+    const color = getColorForSocket(roomId, socket.id);
+    const userMeta: UserMeta = { socketId: socket.id, userId, userName, roomId, color };
+    roomUsers.get(roomId)!.set(socket.id, userMeta);
 
-    // Debounced DB persistence
-    schedulePersist(roomId);
+    // Hydrate files from DB or memory cache
+    const fileCache = await ensureRoomHydrated(roomId);
+
+    // Send latest authoritative room state with versions
+    const files = Array.from(fileCache.values()).map((state) => ({
+      id: state.id,
+      path: state.path,
+      name: state.name,
+      content: state.content,
+      language: state.language,
+      version: state.version,
+      updatedAt: state.updatedAt.toISOString(),
+    }));
+
+    socket.emit("room_state", { roomId, files });
+
+    // Broadcast presence
+    broadcastPresence(roomId);
+    socket.to(roomId).emit("user_joined", {
+      userId,
+      userName,
+      socketId: socket.id,
+      color,
+    });
+  });
+
+  // ----------------------------------------------------------
+  // LEAVE ROOM (Explicit teardown of room presence)
+  // ----------------------------------------------------------
+  socket.on("leave_room", ({ roomId }: { roomId: string }) => {
+    if (!roomId) return;
+    socket.leave(roomId);
+    socket.leave(`room:${roomId}`);
+    const users = roomUsers.get(roomId);
+    if (users && users.has(socket.id)) {
+      const meta = users.get(socket.id)!;
+      users.delete(socket.id);
+      socket.to(roomId).emit("user_left", {
+        userId: meta.userId,
+        userName: meta.userName,
+        socketId: socket.id,
+      });
+      broadcastPresence(roomId);
+      if (users.size === 0) {
+        roomUsers.delete(roomId);
+        flushToDB(roomId);
+      }
+    }
+  });
+
+  // ----------------------------------------------------------
+  // JOIN FILE (Scopes client to specific file channel)
+  // Format: project:<projectId>:file:<fileId>
+  // Payload: { roomId, fileId, filePath }
+  // 1. Authenticate user.
+  // 2. Verify project access.
+  // 3. Verify file access.
+  // 4. Join room.
+  // 5. Send latest document.
+  // 6. Send document version.
+  // 7. Send presence.
+  // ----------------------------------------------------------
+  socket.on("join_file", async ({ roomId, fileId, filePath }: { roomId: string; fileId?: string; filePath?: string }) => {
+    if (!roomId) {
+      socket.emit("file_access_error", { error: "Room ID is required" });
+      return;
+    }
+
+    // 1. Authenticate user via active room session
+    const roomMap = roomUsers.get(roomId);
+    if (!roomMap || !roomMap.has(socket.id)) {
+      socket.emit("file_access_error", { error: "Unauthorized: Must join room before joining file" });
+      return;
+    }
+
+    // 2. Verify project access
+    const fileCache = await ensureRoomHydrated(roomId);
+
+    // 3. Verify file access
+    const fileState = (filePath ? fileCache.get(filePath) : undefined) ??
+      (fileId ? Array.from(fileCache.values()).find((f) => f.id === fileId) : undefined);
+
+    if (!fileState) {
+      socket.emit("file_access_error", { error: "File not found or access denied" });
+      return;
+    }
+
+    // 4. Join deterministic room
+    const deterministicRoomKey = `project:${roomId}:file:${fileState.id}`;
+    socket.join(deterministicRoomKey);
+    socket.join(`room:${roomId}:file:${fileState.path}`);
+
+    // Update active file for user presence
+    roomMap.get(socket.id)!.currentFilePath = fileState.path;
+
+    // 5 & 6. Send latest document & version
+    socket.emit("file_state", {
+      roomId,
+      fileId: fileState.id,
+      filePath: fileState.path,
+      version: fileState.version,
+      content: fileState.content,
+      language: fileState.language,
+      updatedAt: fileState.updatedAt.toISOString(),
+      updatedBy: fileState.updatedBy,
+    });
+
+    // 7. Send presence
+    broadcastPresence(roomId);
+  });
+
+  // ----------------------------------------------------------
+  // DOCUMENT VERSIONING: CODE CHANGE SYNC
+  // Payload: { roomId, fileId?, filePath, version, content?, code?, senderId, language? }
+  // Server is Authoritative:
+  // - clientVersion === serverVersion: accept, increment, broadcast, ack.
+  // - clientVersion < serverVersion: reject, return SYNC_REQUIRED.
+  // ----------------------------------------------------------
+  socket.on("code_change", async (payload: CodeChangePayload) => {
+    const { roomId, filePath, version: clientVersion, senderId, language } = payload;
+    const newContent = payload.content !== undefined ? payload.content : payload.code ?? "";
+
+    if (!roomId || !filePath) return;
+
+    const fileCache = await ensureRoomHydrated(roomId);
+    let state = fileCache.get(filePath);
+
+    if (!state) {
+      // Create new file state if missing
+      const fileName = filePath.split("/").pop() ?? filePath;
+      state = {
+        id: payload.fileId || `file-${Date.now()}`,
+        path: filePath,
+        name: fileName,
+        content: newContent,
+        language: language ?? "cpp",
+        version: 1,
+        updatedAt: new Date(),
+        updatedBy: senderId,
+      };
+      fileCache.set(filePath, state);
+    }
+
+    // Version Check
+    // If client is sending an update with matching version, accept and increment
+    if (clientVersion === state.version) {
+      state.version += 1;
+      state.content = newContent;
+      if (language) state.language = language;
+      state.updatedAt = new Date();
+      state.updatedBy = senderId;
+
+      // Broadcast authoritative update to peers
+      socket.to(roomId).emit("code_update", {
+        roomId,
+        fileId: state.id,
+        filePath: state.path,
+        version: state.version,
+        content: state.content,
+        code: state.content, // backward compatibility
+        senderId,
+      });
+
+      // Acknowledge sender with new incremented version
+      socket.emit("code_ack", {
+        fileId: state.id,
+        filePath: state.path,
+        version: state.version,
+      });
+
+      // Debounced DB persistence
+      schedulePersist(roomId);
+    } else if (clientVersion < state.version) {
+      // Stale update! Reject and return authoritative version & content
+      socket.emit("sync_required", {
+        roomId,
+        fileId: state.id,
+        filePath: state.path,
+        version: state.version,
+        content: state.content,
+        code: state.content,
+        message: "Stale document version rejected. Synchronized with server authoritative state.",
+      });
+    } else {
+      // Client is somehow ahead of server — accept and sync server version
+      state.version = clientVersion + 1;
+      state.content = newContent;
+      state.updatedAt = new Date();
+      state.updatedBy = senderId;
+
+      socket.to(roomId).emit("code_update", {
+        roomId,
+        fileId: state.id,
+        filePath: state.path,
+        version: state.version,
+        content: state.content,
+        code: state.content,
+        senderId,
+      });
+
+      socket.emit("code_ack", {
+        fileId: state.id,
+        filePath: state.path,
+        version: state.version,
+      });
+
+      schedulePersist(roomId);
+    }
+  });
+
+  // ----------------------------------------------------------
+  // TRANSIENT PRESENCE: CURSOR UPDATE
+  // Payload: { roomId, fileId?, filePath, cursor, selection? }
+  // Not permanently saved to PostgreSQL
+  // ----------------------------------------------------------
+  socket.on("cursor_update", (payload: CursorPayload) => {
+    const { roomId, filePath, cursor, selection } = payload;
+    if (!roomId) return;
+
+    const roomMap = roomUsers.get(roomId);
+    if (roomMap && roomMap.has(socket.id)) {
+      const meta = roomMap.get(socket.id)!;
+      meta.currentFilePath = filePath;
+      meta.cursor = cursor;
+
+      socket.to(roomId).emit("cursor_update", {
+        roomId,
+        filePath,
+        socketId: socket.id,
+        userId: meta.userId,
+        userName: meta.userName,
+        color: meta.color,
+        cursor,
+        selection,
+      });
+    }
   });
 
   // ----------------------------------------------------------
   // LANGUAGE CHANGE (per file)
-  // Payload: { roomId, filePath, language, senderId }
   // ----------------------------------------------------------
   socket.on("language_change", ({ roomId, filePath, language, senderId }: LanguagePayload) => {
     const fileCache = roomFileCache.get(roomId);
@@ -210,11 +574,11 @@ io.on("connection", (socket: Socket) => {
       const state = fileCache.get(filePath);
       if (state) {
         state.language = language;
+        state.version += 1;
       }
     }
     socket.to(roomId).emit("language_update", { filePath, language, senderId, roomId });
 
-    // Persist language change to DB File record
     prisma.file.updateMany({
       where: { roomId, path: filePath },
       data: { language },
@@ -222,45 +586,76 @@ io.on("connection", (socket: Socket) => {
   });
 
   // ----------------------------------------------------------
-  // FILE CREATED (new file added to workspace)
-  // Payload: { roomId, filePath, name, language, content }
+  // FILE CREATED
   // ----------------------------------------------------------
   socket.on("file_created", async ({
     roomId, filePath, name, language, content,
   }: { roomId: string; filePath: string; name: string; language: string; content: string }) => {
-    // Update cache
-    const fileCache = roomFileCache.get(roomId) ?? new Map<string, FileState>();
-    fileCache.set(filePath, { content, language });
-    roomFileCache.set(roomId, fileCache);
+    const fileCache = await ensureRoomHydrated(roomId);
+    const existing = fileCache.get(filePath);
+    const version = existing ? existing.version + 1 : 1;
 
-    // Persist to DB
     try {
-      await prisma.file.upsert({
+      const file = await prisma.file.upsert({
         where: { roomId_path: { roomId, path: filePath } },
-        create: { roomId, path: filePath, name, content, language },
-        update: { name, content, language },
+        create: { roomId, path: filePath, name, content, language, version },
+        update: { name, content, language, version },
       });
-    } catch (err) {
-      console.error("[DB] file_created persist failed:", err);
-    }
 
-    // Broadcast to all peers (including creator for confirmation)
-    io.to(roomId).emit("file_created", { filePath, name, language, content });
+      fileCache.set(filePath, {
+        id: file.id,
+        path: filePath,
+        name,
+        content,
+        language,
+        version: file.version,
+        updatedAt: file.updatedAt,
+      });
+
+      io.to(roomId).emit("file_created", {
+        fileId: file.id,
+        filePath,
+        name,
+        language,
+        content,
+        version: file.version,
+      });
+    } catch (err: any) {
+      console.error("[DB] file_created persist failed:", err.message);
+    }
   });
 
   // ----------------------------------------------------------
-  // FILE DELETED
-  // Payload: { roomId, filePath }
+  // FILE DELETED (Enforce workspace owner permission)
   // ----------------------------------------------------------
   socket.on("file_deleted", async ({ roomId, filePath }: { roomId: string; filePath: string }) => {
-    // Remove from cache
+    if (!roomId || !filePath) return;
+    const user = roomUsers.get(roomId)?.get(socket.id);
+
+    try {
+      const room = await prisma.room.findUnique({
+        where: { id: roomId },
+        select: { creatorId: true },
+      });
+
+      // If room has an authoritative owner and the requester is not the owner, reject deletion
+      if (room?.creatorId && user?.userId && room.creatorId !== user.userId) {
+        socket.emit("file_delete_failed", {
+          error: "Permission denied: Only the workspace owner can delete files.",
+          filePath,
+        });
+        return;
+      }
+    } catch (err: any) {
+      console.error("[DB] file_deleted auth check failed:", err.message);
+    }
+
     roomFileCache.get(roomId)?.delete(filePath);
 
-    // Remove from DB
     try {
       await prisma.file.deleteMany({ where: { roomId, path: filePath } });
-    } catch (err) {
-      console.error("[DB] file_deleted failed:", err);
+    } catch (err: any) {
+      console.error("[DB] file_deleted failed:", err.message);
     }
 
     io.to(roomId).emit("file_deleted", { filePath });
@@ -268,13 +663,15 @@ io.on("connection", (socket: Socket) => {
 
   // ----------------------------------------------------------
   // FILE RENAMED
-  // Payload: { roomId, oldPath, newPath, newName }
   // ----------------------------------------------------------
   socket.on("file_renamed", async ({ roomId, oldPath, newPath, newName }: { roomId: string; oldPath: string; newPath: string; newName: string }) => {
     const fileCache = roomFileCache.get(roomId);
     if (fileCache && fileCache.has(oldPath)) {
       const state = fileCache.get(oldPath)!;
       fileCache.delete(oldPath);
+      state.path = newPath;
+      state.name = newName;
+      state.version += 1;
       fileCache.set(newPath, state);
     }
 
@@ -283,49 +680,41 @@ io.on("connection", (socket: Socket) => {
         where: { roomId, path: oldPath },
         data: { path: newPath, name: newName },
       });
-    } catch (err) {
-      console.error("[DB] file_renamed failed:", err);
+    } catch (err: any) {
+      console.error("[DB] file_renamed failed:", err.message);
     }
 
     io.to(roomId).emit("file_renamed", { oldPath, newPath, newName });
   });
 
   // ----------------------------------------------------------
-  // CHAT MESSAGE
+  // CHAT MESSAGE (Real-time Socket broadcast, zero DB disk bloat)
   // ----------------------------------------------------------
   socket.on("chat_message", async (payload: ChatPayload) => {
     const { roomId, senderId, senderName, content, msgId } = payload;
     const message = { id: msgId, senderName, senderId, content, createdAt: new Date().toISOString() };
     io.to(roomId).emit("chat_message", message);
-
-    prisma.message.create({
-      data: { roomId, content, senderName, userId: senderId || null },
-    }).catch((err) => console.error("[DB] Message persist failed:", err));
   });
 
   // ----------------------------------------------------------
-  // COMMIT SNAPSHOT (VCS) — multi-file aware
-  // Payload: { roomId, message, filesSnapshot, code?, language?, userId, authorName }
+  // COMMIT SNAPSHOT (VCS)
   // ----------------------------------------------------------
   socket.on("commit_snapshot", async (payload: CommitPayload) => {
     const { roomId, message, filesSnapshot, code, language, userId, authorName } = payload;
 
-    console.log(`[VCS] commit_snapshot triggered — room: ${roomId}, author: ${authorName}, files: ${filesSnapshot?.length ?? "legacy"}`);
-
-    // Build the filesSnapshot from live cache if not provided by client
     let snapshot = filesSnapshot;
     if (!snapshot || snapshot.length === 0) {
       const fileCache = roomFileCache.get(roomId);
       if (fileCache && fileCache.size > 0) {
-        snapshot = Array.from(fileCache.entries()).map(([path, state]) => {
-          const name = path.split("/").pop() ?? path;
-          return { path, name, language: state.language, content: state.content };
-        });
-        console.log(`[VCS] Built filesSnapshot from cache: ${snapshot.length} file(s)`);
+        snapshot = Array.from(fileCache.values()).map((state) => ({
+          path: state.path,
+          name: state.name,
+          language: state.language,
+          content: state.content,
+        }));
       }
     }
 
-    // Derive legacy code/language for backward compat
     const legacyCode = code ?? snapshot?.[0]?.content ?? "";
     const legacyLang = language ?? snapshot?.[0]?.language ?? "cpp";
 
@@ -342,8 +731,6 @@ io.on("connection", (socket: Socket) => {
         },
       });
 
-      console.log(`[VCS] Commit saved: ${commit.id} — "${commit.message}" by ${commit.authorName}`);
-
       io.to(roomId).emit("commit_created", {
         id: commit.id,
         message: commit.message,
@@ -354,98 +741,60 @@ io.on("connection", (socket: Socket) => {
         createdAt: commit.createdAt.toISOString(),
       });
     } catch (err) {
-      console.error("[VCS] commit_snapshot FAILED — DB write error:", err);
+      console.error("[VCS] commit_snapshot DB error:", err);
       socket.emit("commit_error", { error: "Failed to save commit to database" });
     }
   });
 
   // ----------------------------------------------------------
   // ROLLBACK (VCS)
-  // Payload: { roomId, commitId, requestedBy? }
   // ----------------------------------------------------------
   socket.on("rollback", async ({ roomId, commitId, requestedBy }: RollbackPayload) => {
-    console.log(`[VCS] rollback requested — commitId: ${commitId}, room: ${roomId}, by: ${requestedBy ?? "unknown"}`);
-
     try {
       const commit = await prisma.commit.findUnique({ where: { id: commitId } });
-      if (!commit) {
-        console.error(`[VCS] rollback FAILED — commit ${commitId} not found in DB`);
-        socket.emit("rollback_error", { error: "Commit not found" });
+      if (!commit || commit.roomId !== roomId) {
+        socket.emit("rollback_error", { error: "Commit not found or mismatched room" });
         return;
       }
 
-      if (commit.roomId !== roomId) {
-        console.error(`[VCS] rollback FAILED — commit ${commitId} belongs to room ${commit.roomId}, not ${roomId}`);
-        socket.emit("rollback_error", { error: "Commit does not belong to this room" });
-        return;
-      }
-
-      // Determine file states to restore
       const filesSnapshot = commit.filesSnapshot as Array<{ path: string; name: string; language: string; content: string }> | null;
 
       if (filesSnapshot && filesSnapshot.length > 0) {
-        // ── Multi-file rollback ──────────────────────────────────────────────
-        console.log(`[VCS] rollback restoring ${filesSnapshot.length} file(s) from snapshot`);
-
-        // Update in-memory cache
+        const fileCache = await ensureRoomHydrated(roomId);
         const newFileCache: RoomFileCache = new Map();
+
         for (const f of filesSnapshot) {
-          newFileCache.set(f.path, { content: f.content, language: f.language });
+          const oldState = fileCache.get(f.path);
+          const nextVersion = (oldState?.version || 1) + 1;
+
+          const updated = await prisma.file.upsert({
+            where: { roomId_path: { roomId, path: f.path } },
+            create: { roomId, path: f.path, name: f.name, content: f.content, language: f.language, version: nextVersion },
+            update: { content: f.content, language: f.language, version: nextVersion },
+          });
+
+          newFileCache.set(f.path, {
+            id: updated.id,
+            path: f.path,
+            name: f.name,
+            content: f.content,
+            language: f.language,
+            version: nextVersion,
+            updatedAt: new Date(),
+          });
         }
+
         roomFileCache.set(roomId, newFileCache);
 
-        // Persist each file to DB
-        for (const f of filesSnapshot) {
-          await prisma.file.upsert({
-            where: { roomId_path: { roomId, path: f.path } },
-            create: { roomId, path: f.path, name: f.name, content: f.content, language: f.language },
-            update: { content: f.content, language: f.language },
-          }).catch((err) => console.error(`[VCS] rollback file upsert failed for ${f.path}:`, err));
-        }
-
-        // Also update Room legacy fields to first file for compat
-        await prisma.room.update({
-          where: { id: roomId },
-          data: { code: filesSnapshot[0]!.content, language: filesSnapshot[0]!.language },
-        }).catch((err) => console.error("[VCS] rollback Room update failed:", err));
-
-        // Force-sync event broadcast to ALL users (including sender)
         io.to(roomId).emit("rollback_applied", {
           commitId,
           commitMessage: commit.message,
           filesSnapshot,
-          // Legacy fields for compat
           code: filesSnapshot[0]!.content,
           language: filesSnapshot[0]!.language,
         });
-
-      } else {
-        // ── Legacy single-file rollback ──────────────────────────────────────
-        console.log(`[VCS] rollback using legacy single-file code (no filesSnapshot)`);
-
-        const fileCache = roomFileCache.get(roomId) ?? new Map<string, FileState>();
-        // Infer the primary file path from cache
-        const primaryPath = fileCache.size > 0 ? Array.from(fileCache.keys())[0]! : `/main.${commit.language === "javascript" ? "js" : commit.language === "python" ? "py" : "cpp"}`;
-        fileCache.set(primaryPath, { content: commit.code, language: commit.language });
-        roomFileCache.set(roomId, fileCache);
-
-        await prisma.room.update({
-          where: { id: roomId },
-          data: { code: commit.code, language: commit.language },
-        }).catch((err) => console.error("[VCS] rollback Room update failed:", err));
-
-        io.to(roomId).emit("rollback_applied", {
-          commitId,
-          commitMessage: commit.message,
-          code: commit.code,
-          language: commit.language,
-          filesSnapshot: null,
-        });
       }
 
-      console.log(`[VCS] rollback complete — room ${roomId} restored to commit "${commit.message}"`);
-
-      // Create a rollback marker commit in history
       await prisma.commit.create({
         data: {
           roomId,
@@ -455,19 +804,17 @@ io.on("connection", (socket: Socket) => {
           filesSnapshot: commit.filesSnapshot ?? undefined,
           authorName: requestedBy ?? "System",
         },
-      }).catch((err) => console.error("[VCS] rollback marker commit failed:", err));
-
+      });
     } catch (err) {
-      console.error("[VCS] rollback FAILED — unexpected error:", err);
+      console.error("[VCS] rollback failed:", err);
       socket.emit("rollback_error", { error: "Rollback operation failed" });
     }
   });
 
   // ----------------------------------------------------------
-  // ANTIGRAVITY EASTER EGG SYNC
+  // EASTER EGG SYNC
   // ----------------------------------------------------------
   socket.on("antigravity_trigger", ({ roomId, senderName, mode, quote }: { roomId: string; senderName: string; mode?: string; quote?: string }) => {
-    console.log(`[Antigravity] 🌌 Easter egg triggered by ${senderName} in room ${roomId}`);
     io.to(roomId).emit("antigravity_triggered", {
       senderName,
       mode: mode || "zero-g",
@@ -480,8 +827,6 @@ io.on("connection", (socket: Socket) => {
   // DISCONNECT CLEANUP
   // ----------------------------------------------------------
   socket.on("disconnect", (reason) => {
-    console.log(`[Socket] Client disconnected: ${socket.id} (reason: ${reason})`);
-
     for (const [roomId, users] of roomUsers.entries()) {
       if (users.has(socket.id)) {
         const meta = users.get(socket.id)!;
@@ -511,11 +856,13 @@ io.on("connection", (socket: Socket) => {
 function broadcastPresence(roomId: string) {
   const users = roomUsers.get(roomId);
   if (!users) return;
-  const presence = Array.from(users.entries()).map(([socketId, meta]) => ({
-    socketId,
+  const presence = Array.from(users.values()).map((meta) => ({
+    socketId: meta.socketId,
     userId: meta.userId,
     userName: meta.userName,
     color: meta.color,
+    currentFilePath: meta.currentFilePath,
+    cursor: meta.cursor,
   }));
   io.to(roomId).emit("presence_update", { roomId, users: presence });
 }
@@ -535,35 +882,46 @@ async function flushToDB(roomId: string) {
   if (!fileCache || fileCache.size === 0) return;
 
   try {
-    for (const [path, state] of fileCache.entries()) {
-      const name = path.split("/").pop() ?? path;
+    for (const state of fileCache.values()) {
       await prisma.file.upsert({
-        where: { roomId_path: { roomId, path } },
-        create: { roomId, path, name, content: state.content, language: state.language },
-        update: { content: state.content, language: state.language },
+        where: { roomId_path: { roomId, path: state.path } },
+        create: {
+          roomId,
+          path: state.path,
+          name: state.name,
+          content: state.content,
+          language: state.language,
+          version: state.version,
+        },
+        update: {
+          content: state.content,
+          language: state.language,
+          version: state.version,
+        },
       });
     }
-    // Keep Room legacy code field in sync with primary file
-    const [primaryPath, primaryState] = Array.from(fileCache.entries())[0]!;
-    await prisma.room.update({
-      where: { id: roomId },
-      data: { code: primaryState.content, language: primaryState.language },
-    });
-    console.log(`[DB] Persisted ${fileCache.size} file(s) for room ${roomId}`);
-  } catch (err) {
-    console.warn(`[DB] Persist skipped for room ${roomId}:`, (err as any).message);
+
+    const first = Array.from(fileCache.values())[0];
+    if (first) {
+      await prisma.room.update({
+        where: { id: roomId },
+        data: { code: first.content, language: first.language },
+      });
+    }
+  } catch (err: any) {
+    console.warn(`[DB] Persist error for room ${roomId}:`, err.message);
   }
 }
 
 // ============================================================
-// START
+// START & EXPORT
 // ============================================================
 
 const SOCKET_PORT = Number(process.env.SOCKET_PORT) || 3001;
 httpServer.listen(SOCKET_PORT, () => {
   console.log(`[CodeCollab] 🔌 Socket.io sync server running on port ${SOCKET_PORT}`);
-  console.log(`[CodeCollab] 📁 Multi-file workspace sync: enabled`);
-  console.log(`[CodeCollab] 🔄 Long-polling fallback: enabled`);
+  console.log(`[CodeCollab] ⚡ Server-authoritative document versioning: ENABLED`);
+  console.log(`[CodeCollab] 🌐 Redis Socket.IO adapter: CONNECTED`);
 });
 
-export { io };
+export { io, httpServer, app };

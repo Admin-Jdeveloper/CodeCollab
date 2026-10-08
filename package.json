@@ -2,10 +2,24 @@
   "name": "codecollab-monorepo",
   "private": true,
   "scripts": {
+    "worker": "bun run backend/execution/worker.ts",
     "daemon": "bun run local-runner/daemon.ts",
     "dev:frontend": "cd frontend && bun run dev",
     "dev:backend": "cd backend && bun run dev",
     "dev:socket": "cd backend && bun run dev:socket",
-    "prisma": "cd backend && bunx --bun prisma"
+    "prisma": "cd backend && bunx --bun prisma",
+    "db:push": "cd backend && bunx --bun prisma db push",
+    "db:migrate": "cd backend && bunx --bun prisma migrate deploy",
+    "test:execution": "bun run tests/execution.test.ts",
+    "test:collaboration": "bun run tests/collaboration.test.ts",
+    "test:scaling": "bun run tests/scaling.test.ts",
+    "test:multi-socket": "bun run tests/multi-socket.test.ts",
+    "test:security": "bun run tests/security.test.ts",
+    "test:load": "bun run tests/load.test.ts",
+    "test:auth": "bun run tests/auth-reconnection.test.ts",
+    "test": "bun run test:auth && bun run test:execution && bun run test:collaboration && bun run test:scaling && bun run test:multi-socket && bun run test:security && bun run test:load",
+    "typecheck": "cd backend && bun run typecheck && cd ../frontend && bun run typecheck",
+    "lint": "cd frontend && bun run lint",
+    "build": "cd frontend && bun run build"
   }
 }

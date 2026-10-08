@@ -9,15 +9,16 @@
  */
 
 import { parseDiagnostics, type DiagnosticItem } from "./errorParser";
-import { parseAntigravityTrigger } from "./editorParser";
 
 export interface ExecutionRequest {
   language: string; // widened — supports any workspace file language
   code: string;
   input?: string;
   timeoutMs?: number;
+  roomId?: string;
+  fileId?: string;
+  userId?: string;
 }
-
 
 export interface ExecutionResult {
   success: boolean;
@@ -27,7 +28,7 @@ export interface ExecutionResult {
   exitCode: number;
   executionTimeMs: number;
   diagnostics: DiagnosticItem[];
-  runtime: "local-daemon" | "browser-wasm" | "browser-worker";
+  runtime: "docker-sandbox" | "local-daemon" | "browser-wasm" | "browser-worker";
   runtimeDetails: string;
 }
 
@@ -36,16 +37,31 @@ const LOCAL_DAEMON_PROXY_URL = "/api/daemon";
 
 /**
  * Pings the local daemon to see if it's currently running.
- * Tries direct 127.0.0.1:4000 first, then falls back to /api/daemon proxy
- * to prevent any browser CORS or Private Network Access restrictions.
+ * Tries same-origin /api/daemon proxy first (which bypasses browser CORS / PNA restrictions),
+ * then falls back to direct 127.0.0.1:4000.
  */
 export async function checkLocalDaemon(): Promise<boolean> {
   if (typeof window === "undefined") return false;
   
-  // 1. Try direct loopback connection
+  // 1. Try same-origin Next.js server proxy (immune to browser CORS / PNA policies)
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 800);
+    const timeout = setTimeout(() => controller.abort(), 2500);
+    const res = await fetch(LOCAL_DAEMON_PROXY_URL, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.status === "ok") return true;
+    }
+  } catch {}
+
+  // 2. Try direct loopback connection
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
     const res = await fetch(`${LOCAL_DAEMON_DIRECT_URL}/health`, {
       method: "GET",
       signal: controller.signal,
@@ -57,44 +73,33 @@ export async function checkLocalDaemon(): Promise<boolean> {
     }
   } catch {}
 
-  // 2. Try proxy through Next.js server
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 1200);
-    const res = await fetch(LOCAL_DAEMON_PROXY_URL, {
-      method: "GET",
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (res.ok) {
-      const data = await res.json();
-      return data.status === "ok";
-    }
-  } catch {}
-
   return false;
 }
 
 /**
  * Execute via local daemon (runs native local compiler/interpreter).
- * Tries direct port 4000 first, then Next.js server proxy.
+ * Tries same-origin /api/daemon proxy first (guaranteed CORS-free), then direct loopback.
  */
 async function executeViaDaemon(req: ExecutionRequest): Promise<ExecutionResult> {
   const startTime = performance.now();
   let res: Response | null = null;
+  const timeoutMs = (req.timeoutMs || 50000) + 20000;
 
-  // 1. Try direct
+  // 1. Try same-origin /api/daemon proxy first (which routes to BullMQ + Docker)
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), (req.timeoutMs || 6000) + 10000);
-    res = await fetch(`${LOCAL_DAEMON_DIRECT_URL}/run`, {
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    res = await fetch(LOCAL_DAEMON_PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         language: req.language,
         code: req.code,
         input: req.input || "",
-        timeoutMs: req.timeoutMs || 8000,
+        timeoutMs: req.timeoutMs || 50000,
+        roomId: req.roomId,
+        fileId: req.fileId,
+        userId: req.userId,
       }),
       signal: controller.signal,
     });
@@ -103,29 +108,57 @@ async function executeViaDaemon(req: ExecutionRequest): Promise<ExecutionResult>
     res = null;
   }
 
-  // 2. If direct fetch failed (e.g. CORS/PNA), try proxy
+  // 2. Direct backend API fallback
   if (!res || !res.ok) {
     try {
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:3000";
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), (req.timeoutMs || 6000) + 12000);
-      res = await fetch(LOCAL_DAEMON_PROXY_URL, {
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      const runRes = await fetch(`${backendUrl}/api/execution/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           language: req.language,
-          code: req.code,
-          input: req.input || "",
-          timeoutMs: req.timeoutMs || 8000,
+          sourceCode: req.code,
+          stdin: req.input || "",
+          roomId: req.roomId,
+          fileId: req.fileId,
+          userId: req.userId,
         }),
         signal: controller.signal,
       });
+
+      if (runRes.ok) {
+        const { executionId } = await runRes.json();
+        // Poll for completion
+        const startPoll = Date.now();
+        while (Date.now() - startPoll < timeoutMs) {
+          await new Promise((r) => setTimeout(r, 400));
+          const check = await fetch(`${backendUrl}/api/execution/${executionId}`);
+          if (check.ok) {
+            const { execution } = await check.json();
+            if (execution && execution.status !== "QUEUED" && execution.status !== "RUNNING") {
+              clearTimeout(timeout);
+              res = new Response(JSON.stringify({
+                success: execution.status === "COMPLETED",
+                stdout: execution.stdout || "",
+                stderr: execution.stderr || "",
+                compilerLog: execution.compilerLog || "",
+                exitCode: execution.exitCode ?? (execution.status === "COMPLETED" ? 0 : 1),
+                executionTimeMs: execution.executionTimeMs || (Date.now() - startTime),
+              }), { status: 200, headers: { "Content-Type": "application/json" } });
+              break;
+            }
+          }
+        }
+      }
       clearTimeout(timeout);
     } catch {}
   }
 
   if (!res || !res.ok) {
     const errData = res ? await res.json().catch(() => ({})) : {};
-    throw new Error(errData.error || (res ? `Daemon returned HTTP ${res.status}` : "Daemon unreachable"));
+    throw new Error(errData.error || (res ? `Execution server returned HTTP ${res.status}` : "Execution service unreachable"));
   }
 
   const data = await res.json();
@@ -145,8 +178,8 @@ async function executeViaDaemon(req: ExecutionRequest): Promise<ExecutionResult>
     exitCode: data.exitCode,
     executionTimeMs: execTime,
     diagnostics,
-    runtime: "local-daemon",
-    runtimeDetails: `Local Machine Daemon • Native ${req.language.toUpperCase()}`,
+    runtime: "docker-sandbox",
+    runtimeDetails: `Docker Sandbox • Restricted Container (${req.language.toUpperCase()})`,
   };
 }
 
@@ -492,13 +525,6 @@ async function executeCppClientFallback(req: ExecutionRequest): Promise<Executio
  * 2. If daemon not running, runs safe in-browser sandboxes for JS and Python
  */
 export async function executeCodeLocally(req: ExecutionRequest): Promise<ExecutionResult> {
-  const antigravityInfo = parseAntigravityTrigger(req.code, req.language);
-
-  // If code includes antigravity, notify UI via custom event
-  if (antigravityInfo.isTriggered && typeof window !== "undefined") {
-    window.dispatchEvent(new CustomEvent("codecollab:antigravity", { detail: antigravityInfo }));
-  }
-
   // 1. Try local daemon first (tries 127.0.0.1, localhost, and /api/daemon proxy)
   let result: ExecutionResult | null = null;
   try {
@@ -524,24 +550,6 @@ export async function executeCodeLocally(req: ExecutionRequest): Promise<Executi
       default:
         throw new Error(`Unsupported language: ${req.language}`);
     }
-  }
-
-  // If antigravity was triggered, prepend the flight telemetry manifest to stdout
-  if (antigravityInfo.isTriggered && result) {
-    const flightManifest = [
-      "🌌 [CODECOLLAB ANTIGRAVITY ENGINE ENGAGED]",
-      "══════════════════════════════════════════════════════════════════",
-      `XKCD #353: "${antigravityInfo.quote}"`,
-      `Orbital Velocity: 7.66 km/s  •  Gravitational Pull (g): 0.00 m/s²`,
-      `Trajectory: Sub-orbital anti-gravitational drift unlocked`,
-      "══════════════════════════════════════════════════════════════════\n",
-    ].join("\n");
-
-    result = {
-      ...result,
-      stdout: `${flightManifest}${result.stdout || "Program completed in zero gravity."}`,
-      runtimeDetails: `${result.runtimeDetails} • [🌌 Zero-G Active]`,
-    };
   }
 
   return result;

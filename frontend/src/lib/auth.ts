@@ -1,12 +1,12 @@
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
-import GitHub from "next-auth/providers/github";
+import Google from "next-auth/providers/google";
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
   providers: [
-    GitHub({
-      clientId: process.env.GITHUB_ID || "",
-      clientSecret: process.env.GITHUB_SECRET || "",
+    Google({
+      clientId: process.env.GOOGLE_CLIENT_ID || process.env.GOOGLE_ID || "",
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET || process.env.GOOGLE_SECRET || "",
     }),
     Credentials({
       name: "Credentials",
@@ -23,7 +23,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         const password = String(credentials.password);
 
         try {
-          const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:3000";
+          const backendUrl = process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:3000";
           const res = await fetch(`${backendUrl}/api/auth/verify`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -83,9 +83,28 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       }
       return session;
     },
+    async redirect({ url, baseUrl }) {
+      // 1. If relative path, resolve against baseUrl to guarantee a valid absolute URL
+      if (url.startsWith("/")) {
+        if (url.startsWith("//") || url.startsWith("/\\")) return baseUrl;
+        return `${baseUrl.replace(/\/$/, "")}${url}`;
+      }
+      // 2. If already an absolute URL, only permit if it shares origin with baseUrl
+      try {
+        const parsedUrl = new URL(url);
+        const parsedBase = new URL(baseUrl);
+        if (parsedUrl.origin === parsedBase.origin) {
+          return url;
+        }
+      } catch {
+        // Fallback on invalid URL
+      }
+      return baseUrl;
+    },
   },
   pages: {
     signIn: "/login",
   },
+  trustHost: true,
   secret: process.env.AUTH_SECRET || process.env.NEXTAUTH_SECRET || "codecollab-ultra-secure-secret-key-32-chars-long",
 });

@@ -1,18 +1,44 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import { io, type Socket } from "socket.io-client";
+import { getSocketUrl } from "@/lib/urlUtils";
 
 // ============================================================
 // Types matching socket-server.ts payloads
 // ============================================================
+
+export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
+
+export interface CursorPosition {
+  lineNumber: number;
+  column: number;
+}
+
+export interface CursorSelection {
+  startLineNumber: number;
+  startColumn: number;
+  endLineNumber: number;
+  endColumn: number;
+}
+
+export interface RemoteCursorEvent {
+  socketId: string;
+  userId: string;
+  userName: string;
+  color: string;
+  filePath: string;
+  cursor: CursorPosition;
+  selection?: CursorSelection;
+}
 
 export interface PresenceUser {
   socketId: string;
   userId: string;
   userName: string;
   color: string;
-  // cursor field intentionally removed — stealth mode (no live cursor rendering)
+  currentFilePath?: string;
+  cursor?: CursorPosition;
 }
 
 export interface ChatMessage {
@@ -44,24 +70,43 @@ export interface CommitSnapshot {
 export interface RollbackPayload {
   commitId: string;
   commitMessage: string;
-  // Multi-file rollback: full list of restored files
   filesSnapshot?: FileSnapshot[] | null;
-  // Legacy single-file compat fields
   code: string;
   language: string;
 }
 
-/** Room state sent to a joining user — includes all current files */
+/** Room state sent to a joining user — includes all current files and their versions */
 export interface RoomStatePayload {
   roomId: string;
-  files: Array<{ path: string; content: string; language: string }>;
+  files: Array<{
+    id?: string;
+    path: string;
+    name?: string;
+    content: string;
+    language: string;
+    version?: number;
+  }>;
+}
+
+export interface SyncRequiredPayload {
+  roomId: string;
+  fileId?: string;
+  filePath: string;
+  version: number;
+  content: string;
+  code?: string;
+  message: string;
 }
 
 export interface SocketRoomCallbacks {
-  /** Initial room state on join — fires once per connection with all file contents */
+  /** Initial room state on join — fires with all file contents and versions */
   onRoomState: (state: RoomStatePayload) => void;
-  /** A peer changed a specific file's content */
-  onCodeUpdate: (filePath: string, code: string, senderId: string) => void;
+  /** A peer changed a specific file's content (includes authoritative version) */
+  onCodeUpdate: (filePath: string, code: string, senderId: string, version?: number) => void;
+  /** Server rejects stale edit and provides latest authoritative document */
+  onSyncRequired?: (payload: SyncRequiredPayload) => void;
+  /** A peer moved cursor */
+  onCursorUpdate?: (event: RemoteCursorEvent) => void;
   /** A peer changed the language of a specific file */
   onLanguageUpdate: (filePath: string, language: string) => void;
   onChatMessage: (msg: ChatMessage) => void;
@@ -71,42 +116,56 @@ export interface SocketRoomCallbacks {
   onCommitCreated: (commit: CommitSnapshot) => void;
   onRollbackApplied: (payload: RollbackPayload) => void;
   /** A new file was created by a peer */
-  onFileCreated?: (file: { filePath: string; name: string; language: string; content: string }) => void;
+  onFileCreated?: (file: { filePath: string; name: string; language: string; content: string; version?: number }) => void;
   /** A file was deleted by a peer */
   onFileDeleted?: (payload: { filePath: string }) => void;
+  /** File deletion was rejected by server (e.g. not workspace owner) */
+  onFileDeleteFailed?: (payload: { error: string; filePath: string }) => void;
   /** A file was renamed by a peer */
   onFileRenamed?: (payload: { oldPath: string; newPath: string; newName: string }) => void;
-  onAntigravityTriggered?: (payload: { senderName: string; mode?: string; quote?: string }) => void;
+  /** Asynchronous execution status updates */
+  onExecutionEvent?: (event: any) => void;
+  /** Connection status changed */
+  onConnectionStatusChange?: (status: ConnectionStatus) => void;
 }
 
-// Singleton socket — avoids duplicate connections in React StrictMode
+// Singleton socket across hot-reloads
 let socketInstance: Socket | null = null;
+
+export interface UseRoomSocketOptions {
+  enabled?: boolean;
+}
 
 export function useRoomSocket(
   roomId: string,
   userId: string,
   userName: string,
-  callbacks: SocketRoomCallbacks
+  callbacks: SocketRoomCallbacks,
+  options: UseRoomSocketOptions = {}
 ) {
+  const { enabled = true } = options;
   const socketRef = useRef<Socket | null>(null);
   const callbacksRef = useRef(callbacks);
   const joinedRoomRef = useRef<string | null>(null);
+  const fileVersionsRef = useRef<Map<string, number>>(new Map());
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("disconnected");
 
-  // Always keep callbacks ref fresh without triggering reconnect
   useEffect(() => {
     callbacksRef.current = callbacks;
   });
 
   useEffect(() => {
-    if (!roomId || !userId) return;
+    if (!enabled || !roomId || !userId) return;
 
-    const SOCKET_URL = process.env.NEXT_PUBLIC_SOCKET_URL || "http://localhost:3001";
+    const SOCKET_URL = getSocketUrl();
 
-    if (!socketInstance || !socketInstance.connected) {
+    if (!socketInstance) {
       socketInstance = io(SOCKET_URL, {
         transports: ["websocket", "polling"],
-        reconnectionAttempts: 10,
-        reconnectionDelay: 1500,
+        reconnection: true,
+        reconnectionAttempts: Infinity,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 5000,
         timeout: 20000,
       });
     }
@@ -119,25 +178,96 @@ export function useRoomSocket(
     // --------------------------------------------------------
 
     const onConnect = () => {
-      console.log(`[Socket] Connected: ${socket.id}`);
-      if (joinedRoomRef.current !== roomId) {
-        socket.emit("join_room", { roomId, userId, userName });
-        joinedRoomRef.current = roomId;
+      console.log(`[Socket] 🟢 Connected to sync cluster: ${socket.id}`);
+      setConnectionStatus("connected");
+      callbacksRef.current.onConnectionStatusChange?.("connected");
+
+      // Join room with last known versions map for seamless sync
+      const lastKnownVersions: Record<string, number> = {};
+      for (const [p, v] of fileVersionsRef.current.entries()) {
+        lastKnownVersions[p] = v;
       }
+
+      socket.emit("join_room", {
+        roomId,
+        userId,
+        userName,
+        lastKnownVersions,
+      });
+      joinedRoomRef.current = roomId;
     };
 
     const onDisconnect = (reason: string) => {
-      console.warn(`[Socket] Disconnected: ${reason}`);
+      console.warn(`[Socket] 🔴 Connection lost: ${reason}`);
+      setConnectionStatus("disconnected");
+      callbacksRef.current.onConnectionStatusChange?.("disconnected");
       joinedRoomRef.current = null;
     };
 
+    const onReconnectAttempt = () => {
+      console.log("[Socket] 🟡 Reconnecting...");
+      setConnectionStatus("reconnecting");
+      callbacksRef.current.onConnectionStatusChange?.("reconnecting");
+    };
+
+    const onConnectError = (err: any) => {
+      console.warn(`[Socket] 🟡 Connection error:`, err?.message || err);
+      setConnectionStatus("reconnecting");
+      callbacksRef.current.onConnectionStatusChange?.("reconnecting");
+    };
+
+    const onReconnectFailed = () => {
+      console.error("[Socket] 🔴 Reconnection failed");
+      setConnectionStatus("disconnected");
+      callbacksRef.current.onConnectionStatusChange?.("disconnected");
+    };
+
     const onRoomState = (state: RoomStatePayload) => {
+      // Record initial versions
+      if (state.files) {
+        for (const f of state.files) {
+          fileVersionsRef.current.set(f.path, f.version || 1);
+        }
+      }
       callbacksRef.current.onRoomState(state);
     };
 
-    // File-scoped code update — includes filePath to target the correct editor
-    const onCodeUpdate = ({ filePath, code, senderId }: { filePath: string; code: string; senderId: string; roomId: string }) => {
-      callbacksRef.current.onCodeUpdate(filePath, code, senderId);
+    // Authoritative Code Update from peer
+    const onCodeUpdate = ({
+      filePath,
+      code,
+      content,
+      senderId,
+      version,
+    }: {
+      filePath: string;
+      code?: string;
+      content?: string;
+      senderId: string;
+      roomId: string;
+      version?: number;
+    }) => {
+      const newText = content !== undefined ? content : code ?? "";
+      if (version !== undefined) {
+        fileVersionsRef.current.set(filePath, version);
+      }
+      callbacksRef.current.onCodeUpdate(filePath, newText, senderId, version);
+    };
+
+    // Server acknowledged local edit
+    const onCodeAck = ({ filePath, version }: { filePath: string; version: number }) => {
+      fileVersionsRef.current.set(filePath, version);
+    };
+
+    // Server rejected stale edit — sync required
+    const onSyncRequired = (payload: SyncRequiredPayload) => {
+      console.warn(`[Socket] Stale version reconciliation for ${payload.filePath} (v${payload.version})`);
+      fileVersionsRef.current.set(payload.filePath, payload.version);
+      callbacksRef.current.onSyncRequired?.(payload);
+    };
+
+    const onCursorUpdate = (event: RemoteCursorEvent) => {
+      callbacksRef.current.onCursorUpdate?.(event);
     };
 
     const onLanguageUpdate = ({ filePath, language }: { filePath: string; language: string }) => {
@@ -168,26 +298,44 @@ export function useRoomSocket(
       callbacksRef.current.onRollbackApplied(payload);
     };
 
-    const onFileCreated = (file: { filePath: string; name: string; language: string; content: string }) => {
+    const onFileCreated = (file: { filePath: string; name: string; language: string; content: string; version?: number }) => {
+      if (file.version !== undefined) {
+        fileVersionsRef.current.set(file.filePath, file.version);
+      }
       callbacksRef.current.onFileCreated?.(file);
     };
 
     const onFileDeleted = (payload: { filePath: string }) => {
+      fileVersionsRef.current.delete(payload.filePath);
       callbacksRef.current.onFileDeleted?.(payload);
     };
 
+    const onFileDeleteFailed = (payload: { error: string; filePath: string }) => {
+      callbacksRef.current.onFileDeleteFailed?.(payload);
+    };
+
     const onFileRenamed = (payload: { oldPath: string; newPath: string; newName: string }) => {
+      const v = fileVersionsRef.current.get(payload.oldPath) || 1;
+      fileVersionsRef.current.delete(payload.oldPath);
+      fileVersionsRef.current.set(payload.newPath, v);
       callbacksRef.current.onFileRenamed?.(payload);
     };
 
-    const onAntigravityTriggered = (payload: { senderName: string; mode?: string; quote?: string }) => {
-      callbacksRef.current.onAntigravityTriggered?.(payload);
+    const onExecutionEvent = (event: any) => {
+      callbacksRef.current.onExecutionEvent?.(event);
     };
 
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
+    socket.on("connect_error", onConnectError);
+    socket.io.on("reconnect_attempt", onReconnectAttempt);
+    socket.io.on("reconnect_error", onConnectError);
+    socket.io.on("reconnect_failed", onReconnectFailed);
     socket.on("room_state", onRoomState);
     socket.on("code_update", onCodeUpdate);
+    socket.on("code_ack", onCodeAck);
+    socket.on("sync_required", onSyncRequired);
+    socket.on("cursor_update", onCursorUpdate);
     socket.on("language_update", onLanguageUpdate);
     socket.on("chat_message", onChatMessage);
     socket.on("presence_update", onPresenceUpdate);
@@ -197,18 +345,29 @@ export function useRoomSocket(
     socket.on("rollback_applied", onRollbackApplied);
     socket.on("file_created", onFileCreated);
     socket.on("file_deleted", onFileDeleted);
+    socket.on("file_delete_failed", onFileDeleteFailed);
     socket.on("file_renamed", onFileRenamed);
-    socket.on("antigravity_triggered", onAntigravityTriggered);
+    socket.on("execution_event", onExecutionEvent);
 
     if (socket.connected) {
       onConnect();
     }
 
     return () => {
+      if (socket.connected) {
+        socket.emit("leave_room", { roomId });
+      }
       socket.off("connect", onConnect);
       socket.off("disconnect", onDisconnect);
+      socket.off("connect_error", onConnectError);
+      socket.io.off("reconnect_attempt", onReconnectAttempt);
+      socket.io.off("reconnect_error", onConnectError);
+      socket.io.off("reconnect_failed", onReconnectFailed);
       socket.off("room_state", onRoomState);
       socket.off("code_update", onCodeUpdate);
+      socket.off("code_ack", onCodeAck);
+      socket.off("sync_required", onSyncRequired);
+      socket.off("cursor_update", onCursorUpdate);
       socket.off("language_update", onLanguageUpdate);
       socket.off("chat_message", onChatMessage);
       socket.off("presence_update", onPresenceUpdate);
@@ -218,19 +377,40 @@ export function useRoomSocket(
       socket.off("rollback_applied", onRollbackApplied);
       socket.off("file_created", onFileCreated);
       socket.off("file_deleted", onFileDeleted);
+      socket.off("file_delete_failed", onFileDeleteFailed);
       socket.off("file_renamed", onFileRenamed);
-      socket.off("antigravity_triggered", onAntigravityTriggered);
+      socket.off("execution_event", onExecutionEvent);
     };
-  }, [roomId, userId, userName]);
+  }, [roomId, userId, userName, enabled]);
 
   // --------------------------------------------------------
-  // EMIT HELPERS (stable references via useCallback)
+  // EMIT HELPERS
   // --------------------------------------------------------
 
-  /** Emit a code change scoped to a specific file path */
-  const emitCodeChange = useCallback((filePath: string, code: string, language?: string) => {
-    socketRef.current?.emit("code_change", { roomId, filePath, code, senderId: userId, language });
+  /** Emit code change with current authoritative version */
+  const emitCodeChange = useCallback((filePath: string, code: string, language?: string, fileId?: string) => {
+    const currentVersion = fileVersionsRef.current.get(filePath) || 1;
+    socketRef.current?.emit("code_change", {
+      roomId,
+      fileId,
+      filePath,
+      version: currentVersion,
+      content: code,
+      code,
+      senderId: userId,
+      language,
+    });
   }, [roomId, userId]);
+
+  /** Emit transient cursor and selection position */
+  const emitCursor = useCallback((filePath: string, cursor: CursorPosition, selection?: CursorSelection) => {
+    socketRef.current?.emit("cursor_update", {
+      roomId,
+      filePath,
+      cursor,
+      selection,
+    });
+  }, [roomId]);
 
   const emitLanguageChange = useCallback((filePath: string, language: string) => {
     socketRef.current?.emit("language_change", { roomId, filePath, language, senderId: userId });
@@ -250,7 +430,6 @@ export function useRoomSocket(
       roomId,
       message,
       filesSnapshot,
-      // Legacy compat: first file as primary
       code: filesSnapshot[0]?.content ?? "",
       language: filesSnapshot[0]?.language ?? "cpp",
       userId,
@@ -274,15 +453,13 @@ export function useRoomSocket(
     socketRef.current?.emit("file_renamed", { roomId, oldPath, newPath, newName });
   }, [roomId]);
 
-  const emitAntigravityTrigger = useCallback((mode: string = "zero-g", quote?: string) => {
-    socketRef.current?.emit("antigravity_trigger", { roomId, senderName: userName, mode, quote });
-  }, [roomId, userName]);
-
   const getSocket = useCallback(() => socketRef.current, []);
 
   return {
     socket: socketRef.current,
+    connectionStatus,
     emitCodeChange,
+    emitCursor,
     emitLanguageChange,
     emitChatMessage,
     emitCommitSnapshot,
@@ -290,7 +467,6 @@ export function useRoomSocket(
     emitFileCreated,
     emitFileDeleted,
     emitFileRenamed,
-    emitAntigravityTrigger,
     getSocket,
   };
 }

@@ -8,7 +8,12 @@
     "dev:socket": "bun --hot socket-server.ts",
     "start": "bun index.ts",
     "start:socket": "bun socket-server.ts",
-    "daemon": "bun run ../local-runner/daemon.ts"
+    "worker": "bun run execution/worker.ts",
+    "daemon": "bun run ../local-runner/daemon.ts",
+    "db:push": "bunx --bun prisma db push",
+    "db:migrate": "bunx --bun prisma migrate deploy",
+    "db:generate": "bunx --bun prisma generate",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/bun": "latest",
@@ -21,16 +26,17 @@
   "dependencies": {
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
+    "@socket.io/redis-adapter": "^8.3.0",
     "@types/bcryptjs": "^3.0.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/socket.io": "^3.0.2",
     "bcryptjs": "^3.0.3",
+    "bullmq": "^6.3.11",
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "http": "^0.0.1-security",
+    "ioredis": "^6.0.0",
     "pg": "^8.22.0",
-    "redis": "^6.0.1",
     "socket.io": "^4.8.4"
   }
 }

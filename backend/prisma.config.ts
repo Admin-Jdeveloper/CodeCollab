@@ -9,6 +9,6 @@ export default defineConfig({
     path: "prisma/migrations",
   },
   datasource: {
-    url: "postgresql://postgres:postgres@localhost:5432/codeduo",
+    url: process.env.DATABASE_URL || "postgresql://postgres:postgres@127.0.0.1:5432/codeduo",
   },
 });

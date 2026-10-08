@@ -1,21 +1,32 @@
 import express from "express";
-import { createClient } from "redis";
-import { prisma } from "./db";
 import cors from "cors";
 import bcrypt from "bcryptjs";
+import { prisma } from "./db";
+import { createRedisClient } from "./redis";
+import { ExecutionRateLimiter } from "./execution/rateLimiter";
+import { enqueueExecution, cancelExecutionJob } from "./execution/queue";
 
 const app = express();
 
 app.use(express.json());
 app.use(cors({ origin: "*", credentials: true }));
 
-// Redis client with graceful error handling so sync server continues even if Redis is inactive
-const client = createClient();
-client.on("error", (_err) => {
-  // Silent in development
+const redis = createRedisClient("api");
+const rateLimiter = new ExecutionRateLimiter(redis);
+
+// ── Health & Readiness Probes ────────────────────────────────
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
-client.connect().catch(() => {
-  console.log("Redis not connected - queue-based submission worker disabled, real-time sync active");
+
+app.get("/ready", async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    const pong = await redis.ping();
+    res.json({ status: "ready", database: "connected", redis: pong });
+  } catch (err: any) {
+    res.status(503).json({ status: "not_ready", error: err.message });
+  }
 });
 
 // ==========================================
@@ -155,19 +166,110 @@ function getStarter(lang: string) {
   return STARTER_CODES[lang] ?? STARTER_CODES.cpp!;
 }
 
+// List workspaces for authenticated user
+app.get("/api/workspaces", async (req, res) => {
+  try {
+    const userId = (req.query.userId as string) || (req.headers["x-user-id"] as string);
+    if (!userId) {
+      return res.status(400).json({ error: "Missing userId parameter" });
+    }
+
+    const workspaces = await prisma.room.findMany({
+      where: { creatorId: userId },
+      orderBy: { updatedAt: "desc" },
+      include: {
+        creator: { select: { id: true, name: true, email: true, image: true } },
+        files: {
+          select: { id: true, name: true, path: true, language: true, version: true },
+          orderBy: { createdAt: "asc" },
+        },
+        commits: {
+          select: { id: true, message: true, authorName: true, createdAt: true },
+          orderBy: { createdAt: "desc" },
+          take: 1,
+        },
+        _count: {
+          select: { files: true, commits: true },
+        },
+      },
+    });
+
+    return res.json({ success: true, workspaces });
+  } catch (err: any) {
+    console.error("List workspaces error:", err);
+    return res.status(500).json({ error: "Failed to fetch workspaces", details: err.message });
+  }
+});
+
+// Delete workspace
+app.delete("/api/room/:id", async (req, res) => {
+  try {
+    const roomId = req.params.id;
+    const userId = (req.query.userId as string) || (req.headers["x-user-id"] as string);
+
+    const room = await prisma.room.findUnique({ where: { id: roomId } });
+    if (!room) {
+      return res.status(404).json({ error: "Workspace not found" });
+    }
+
+    if (room.creatorId && userId && room.creatorId !== userId) {
+      return res.status(403).json({ error: "Unauthorized to delete this workspace" });
+    }
+
+    await prisma.room.delete({ where: { id: roomId } });
+    return res.json({ success: true, message: "Workspace deleted" });
+  } catch (err: any) {
+    console.error("Delete room error:", err);
+    return res.status(500).json({ error: "Failed to delete workspace" });
+  }
+});
+
 // Create a new room
 app.post("/api/room", async (req, res) => {
   try {
-    const { title, language = "cpp", creatorId, code } = req.body;
+    const userKey = req.body.creatorId || req.ip || "anonymous";
+    const rateCheck = await rateLimiter.checkProjectCreation(userKey);
+    if (!rateCheck.allowed) {
+      return res.status(429).json({ error: rateCheck.reason });
+    }
+
+    const { title, language = "cpp", creatorId, code, branch = "main", repoName, isPrivate = false } = req.body;
     const starter = getStarter(language);
     const initialCode = code || starter.code;
+
+    let validCreatorId: string | null = null;
+    if (creatorId) {
+      const userExists = await prisma.user.findUnique({ where: { id: creatorId } });
+      if (userExists) {
+        validCreatorId = creatorId;
+      } else {
+        try {
+          const autoUser = await prisma.user.upsert({
+            where: { id: creatorId },
+            update: {},
+            create: {
+              id: creatorId,
+              email: `${creatorId}@local.dev`,
+              name: "Developer",
+              password: await bcrypt.hash("devpassword", 10),
+            },
+          });
+          validCreatorId = autoUser.id;
+        } catch {
+          validCreatorId = null;
+        }
+      }
+    }
 
     const room = await prisma.room.create({
       data: {
         title: title || "New Collaboration Room",
         language: starter.language,
         code: initialCode,
-        creatorId: creatorId || null,
+        branch,
+        repoName: repoName || null,
+        isPrivate: Boolean(isPrivate),
+        creatorId: validCreatorId,
         files: {
           create: [{ name: starter.name, path: starter.path, content: initialCode, language: starter.language }],
         },
@@ -197,54 +299,96 @@ app.post("/api/room", async (req, res) => {
 // Get room by ID (auto-initializes if not found so room URLs never 404)
 app.get("/api/room/:id", async (req, res) => {
   const roomId = req.params.id;
-  try {
-    let room = await prisma.room.findUnique({
-      where: { id: roomId },
-      include: {
-        creator: { select: { id: true, name: true, image: true, email: true } },
-        files: { orderBy: { createdAt: "asc" } },
-        commits: { orderBy: { createdAt: "desc" }, take: 30 },
-        messages: { orderBy: { createdAt: "asc" }, take: 100 },
-      },
-    });
+  const userId = (req.query.userId as string) || (req.headers["x-user-id"] as string);
+  const maxRetries = 2;
+  let attempt = 0;
 
-    if (!room) {
-      // Auto-create room with the requested ID
-      const starter = getStarter("cpp");
-      room = await prisma.room.create({
-        data: {
-          id: roomId,
-          title: "CodeCollab Room",
-          language: starter.language,
-          code: starter.code,
-          files: {
-            create: [{ name: starter.name, path: starter.path, content: starter.code, language: starter.language }],
-          },
-        },
+  while (attempt <= maxRetries) {
+    attempt++;
+    try {
+      let room = await prisma.room.findUnique({
+        where: { id: roomId },
         include: {
           creator: { select: { id: true, name: true, image: true, email: true } },
           files: { orderBy: { createdAt: "asc" } },
-          commits: true,
-          messages: true,
+          commits: { orderBy: { createdAt: "desc" }, take: 30 },
         },
       });
 
-      await prisma.commit.create({
-        data: {
-          roomId: room.id,
-          message: "Genesis snapshot",
-          code: starter.code,
-          language: starter.language,
-          filesSnapshot: [{ path: starter.path, name: starter.name, language: starter.language, content: starter.code }] as any,
-          authorName: "System",
-        },
-      });
+      // Verify privacy / ownership
+      if (room && room.isPrivate && room.creatorId && userId && room.creatorId !== userId) {
+        return res.status(403).json({ error: "Access denied: This workspace is private" });
+      }
+
+      // Claim workspace if unowned and authenticated user visits
+      if (room && !room.creatorId && userId) {
+        try {
+          const userExists = await prisma.user.findUnique({ where: { id: userId } });
+          if (userExists) {
+            room = await prisma.room.update({
+              where: { id: roomId },
+              data: { creatorId: userId },
+              include: {
+                creator: { select: { id: true, name: true, image: true, email: true } },
+                files: { orderBy: { createdAt: "asc" } },
+                commits: { orderBy: { createdAt: "desc" }, take: 30 },
+              },
+            });
+          }
+        } catch {
+          // Ignore concurrent update
+        }
+      }
+
+      if (!room) {
+        // Auto-create room with the requested ID
+        const starter = getStarter("cpp");
+        let validCreatorId: string | null = null;
+        if (userId) {
+          const u = await prisma.user.findUnique({ where: { id: userId } });
+          if (u) validCreatorId = userId;
+        }
+
+        room = await prisma.room.create({
+          data: {
+            id: roomId,
+            title: "CodeCollab Room",
+            language: starter.language,
+            code: starter.code,
+            creatorId: validCreatorId,
+            files: {
+              create: [{ name: starter.name, path: starter.path, content: starter.code, language: starter.language }],
+            },
+          },
+          include: {
+            creator: { select: { id: true, name: true, image: true, email: true } },
+            files: { orderBy: { createdAt: "asc" } },
+            commits: true,
+          },
+        });
+
+        await prisma.commit.create({
+          data: {
+            roomId: room.id,
+            message: "Genesis snapshot",
+            code: starter.code,
+            language: starter.language,
+            filesSnapshot: [{ path: starter.path, name: starter.name, language: starter.language, content: starter.code }] as any,
+            authorName: "System",
+          },
+        });
+      }
+
+      return res.json({ success: true, room });
+    } catch (err: any) {
+      if (attempt <= maxRetries && (err.message?.includes("timeout") || err.message?.includes("connect"))) {
+        console.warn(`[Backend] Room fetch retry ${attempt}/${maxRetries} after error:`, err.message);
+        await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+        continue;
+      }
+      console.error("Fetch room error:", err);
+      return res.status(500).json({ error: "Failed to fetch room", details: err.message });
     }
-
-    return res.json({ success: true, room });
-  } catch (err: any) {
-    console.error("Fetch room error:", err);
-    return res.status(500).json({ error: "Failed to fetch room", details: err.message });
   }
 });
 
@@ -276,7 +420,7 @@ app.get("/api/rooms/recent", async (_req, res) => {
       orderBy: { updatedAt: "desc" },
       select: {
         id: true, title: true, language: true, updatedAt: true, createdAt: true,
-        _count: { select: { commits: true, messages: true, files: true } },
+        _count: { select: { commits: true, files: true } },
       },
     });
     return res.json({ success: true, rooms });
@@ -347,10 +491,20 @@ app.put("/api/room/:id/files/:fileId", async (req, res) => {
   }
 });
 
-// DELETE a file
+// DELETE a file (Enforce workspace owner permission)
 app.delete("/api/room/:id/files/:fileId", async (req, res) => {
-  const { fileId } = req.params;
+  const { id: roomId, fileId } = req.params;
+  const userId = (req.headers["x-user-id"] as string) || (req.query.userId as string);
   try {
+    const room = await prisma.room.findUnique({
+      where: { id: roomId },
+      select: { creatorId: true },
+    });
+
+    if (room?.creatorId && userId && room.creatorId !== userId) {
+      return res.status(403).json({ error: "Permission denied: Only the workspace owner can delete files." });
+    }
+
     await prisma.file.delete({ where: { id: fileId } });
     return res.json({ success: true });
   } catch (err: any) {
@@ -554,39 +708,122 @@ app.get("/api/diff", async (req, res) => {
 });
 
 // ==========================================
-// Existing Submission Endpoints (Preserved)
+// Code Execution Endpoints (BullMQ + PostgreSQL)
 // ==========================================
 
-app.post("/submission", async (req, res) => {
-  const code = req.body.code;
-  const language = req.body.language;
-
+// Trigger code execution (Immediate async response)
+app.post("/api/execution/run", async (req, res) => {
   try {
-    const response = await prisma.submissions.create({
-      data: { language, code, status: "Processing" },
-    });
+    const { language, sourceCode, code, input, stdin, roomId, projectId, fileId, userId } = req.body;
+    const actualCode = sourceCode || code;
+    const actualStdin = stdin !== undefined ? stdin : input;
+    const actualRoomId = roomId || projectId;
 
-    try {
-      await client.lPush("problems", JSON.stringify({ submissionId: response.id, code, language }));
-    } catch (e) {
-      console.log("Redis queue push skipped:", e);
+    if (!language || !actualCode) {
+      return res.status(400).json({ error: "Missing required fields: language and sourceCode" });
     }
 
-    res.json({ message: "processing", id: response.id });
+    // 1. Validate payload size limits
+    const sizeCheck = rateLimiter.validatePayloadSize(actualCode, actualStdin);
+    if (!sizeCheck.allowed) {
+      return res.status(400).json({ error: sizeCheck.reason });
+    }
+
+    // 2. Validate rate limits
+    const userKey = userId || req.ip || "anonymous";
+    const rateCheck = await rateLimiter.checkRateLimit(userKey);
+    if (!rateCheck.allowed) {
+      return res.status(429).json({ error: rateCheck.reason });
+    }
+
+    // 3. Create QUEUED execution record in Redis with 1-hour TTL (Zero PostgreSQL disk bloat)
+    const executionId = `exec_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const executionRecord = {
+      id: executionId,
+      language,
+      sourceCode: actualCode,
+      stdin: actualStdin || null,
+      roomId: actualRoomId || null,
+      projectId: actualRoomId || null,
+      fileId: fileId || null,
+      userId: userId || null,
+      status: "QUEUED",
+      createdAt: new Date().toISOString(),
+    };
+    await redis.setex(`exec:${executionId}`, 3600, JSON.stringify(executionRecord));
+
+    if (actualRoomId) {
+      await redis.lpush(`room_execs:${actualRoomId}`, JSON.stringify(executionRecord));
+      await redis.ltrim(`room_execs:${actualRoomId}`, 0, 19);
+      await redis.expire(`room_execs:${actualRoomId}`, 3600);
+    }
+
+    // 4. Dispatch job to BullMQ queue
+    await enqueueExecution({
+      executionId,
+      language,
+      sourceCode: actualCode,
+      stdin: actualStdin,
+      roomId: actualRoomId,
+      projectId: actualRoomId,
+      fileId,
+      userId,
+    });
+
+    // 5. Respond immediately without waiting for worker
+    return res.status(202).json({
+      executionId,
+      status: "QUEUED",
+    });
   } catch (err: any) {
-    console.error("Submission error:", err);
-    res.status(500).json({ error: "Failed to create submission" });
+    console.error("Execution dispatch error:", err);
+    return res.status(500).json({ error: "Failed to dispatch execution", details: err.message });
   }
 });
 
-app.get("/submission/:submissionId", async (req, res) => {
+// Fetch single execution record from Redis
+app.get("/api/execution/:id", async (req, res) => {
   try {
-    const response = await prisma.submissions.findFirst({
-      where: { id: req.params.submissionId },
-    });
-    res.json({ submission: response });
+    const raw = await redis.get(`exec:${req.params.id}`);
+    if (!raw) return res.status(404).json({ error: "Execution not found or expired" });
+    const execution = JSON.parse(raw);
+    return res.json({ execution });
   } catch (err: any) {
-    res.status(500).json({ error: "Failed to get submission" });
+    return res.status(500).json({ error: "Failed to fetch execution" });
+  }
+});
+
+// Fetch room execution history from Redis
+app.get("/api/execution/room/:roomId", async (req, res) => {
+  try {
+    const rawItems = await redis.lrange(`room_execs:${req.params.roomId}`, 0, 19);
+    const executions = rawItems.map((item) => JSON.parse(item));
+    return res.json({ executions });
+  } catch (err: any) {
+    return res.status(500).json({ error: "Failed to fetch room executions" });
+  }
+});
+
+// Cancel active or queued execution
+app.post("/api/execution/:id/cancel", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const raw = await redis.get(`exec:${id}`);
+    if (!raw) return res.status(404).json({ error: "Execution not found" });
+    const execution = JSON.parse(raw);
+
+    if (execution.status === "COMPLETED" || execution.status === "FAILED") {
+      return res.status(400).json({ error: `Cannot cancel execution with status ${execution.status}` });
+    }
+
+    await cancelExecutionJob(id, execution.roomId || undefined);
+    execution.status = "CANCELLED";
+    execution.completedAt = new Date().toISOString();
+    await redis.setex(`exec:${id}`, 3600, JSON.stringify(execution));
+
+    return res.json({ success: true, execution });
+  } catch (err: any) {
+    return res.status(500).json({ error: "Failed to cancel execution", details: err.message });
   }
 });
 

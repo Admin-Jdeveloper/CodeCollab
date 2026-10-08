@@ -2,79 +2,99 @@
 
 ## Architecture Overview
 
+```text
+Frontend (Next.js, Port 3003) ←─────────────────────────────→ Browser (Monaco Editor)
+               │                                                      │
+               │ REST API calls (Async)           Socket.IO (WS/poll) │
+               ▼                                                      │
+Backend REST (Bun/Express, Port 3000)                                 │
+               │                                                      │
+               ├──── Prisma ────→ PostgreSQL                          │
+               │                                                      │
+               └──── Redis ─────→ BullMQ Queue ────────┐              │
+                                                       │              │
+Socket Server (Bun/Socket.IO, Port 3001) ←─────────────┼──────────────╯
+               │                                       │
+               ├──── Prisma ────→ PostgreSQL           │
+               └──── Redis Adapter                     │
+                                                       ▼
+                                      Stateless Workers (1..N)
+                                                       │
+                                      Docker Sandbox (alpine:3.20)
 ```
-Frontend  (Next.js, port 3003) ←──────────────────────────────────→ Browser
-              │                                                         │
-              │ REST API calls                     Socket.io (WS/poll) │
-              ↓                                                         │
-Backend REST  (Bun/Express, port 3000)                                  │
-              │                                                         │
-              └──── Prisma ────→ PostgreSQL                             │
-                                                                        │
-Socket Server (Bun/Socket.io, port 3001) ←──────────────────────────╯
-              │
-              └──── Prisma ────→ PostgreSQL
-```
+
+---
 
 ## Quick Start
 
-### 1. Database (PostgreSQL)
-Ensure PostgreSQL is running and `codeduo` database exists:
-```sql
-CREATE DATABASE codeduo;
+### 1. Database & Cache
+Ensure PostgreSQL and Redis are running:
+```bash
+docker compose up -d postgres redis
 ```
 
-Run Prisma migration from `/backend`:
+### 2. Generate Prisma Client & Migrate Schema
 ```bash
 cd backend
-.\node_modules\.bin\prisma.exe migrate dev --name init
+bunx prisma generate
+bunx prisma db push
 ```
 
-### 2. Backend REST API (Port 3000)
+### 3. Build Runner Sandbox Image
 ```bash
-cd backend
-bun run dev
+docker build -t codecollab-runner:latest -f docker/Dockerfile.runner .
 ```
 
-### 3. Socket.io Sync Server (Port 3001)
-Open a new terminal:
+### 4. Start Development Services
+
+**Option A: Using Docker Compose**
 ```bash
-cd backend
+docker compose up --build
+```
+
+**Option B: Running with Bun locally**
+In separate terminals:
+```bash
+# Terminal 1: Backend REST API (Port 3000)
+bun run dev:backend
+
+# Terminal 2: Socket.IO Server (Port 3001)
 bun run dev:socket
-```
 
-### 4. Frontend (Port 3003)
-Open a new terminal:
-```bash
-cd frontend
-bun run dev
-```
+# Terminal 3: BullMQ Execution Worker
+bun run worker
 
-### 5. Local Execution Daemon (Port 4000, Optional for Native G++/Python)
-Run code natively and decentralized on your local machine:
-```bash
-bun run daemon
+# Terminal 4: Frontend Web App (Port 3003)
+bun run dev:frontend
 ```
-*Note: If the daemon is not running, CodeCollab automatically falls back to in-browser execution via Web Workers (JS) and Pyodide WebAssembly (Python).*
 
 Then open **http://localhost:3003** in your browser.
 
-## Testing Multi-User Sync
+---
 
-1. Create a room at http://localhost:3003
-2. Copy the room invite link (click the room ID badge)
-3. Open the link in a second browser tab or incognito window
-4. Log in as `alice@codecollab.dev` in one tab, `bob@codecollab.dev` in the other (password: `password123`)
-5. Type code in either editor — changes propagate in real-time
-6. Observe the cursor position indicator appear for the peer
-7. Send chat messages in the Discussion panel — they broadcast instantly
-8. Test local execution by clicking **Run** — compiler diagnostics map to code lines
+## Verification & Automated Testing
 
-## Port Map
+Run the full automated test suite:
+```bash
+bun run test
+```
+
+Or run individual suites:
+- `bun run test:execution` — Multi-language runner sandbox tests
+- `bun run test:collaboration` — Real-time editing, presence, and versioning tests
+- `bun run test:multi-socket` — Socket.IO cluster Redis adapter tests
+- `bun run test:scaling` — Worker concurrency, cancellation, failover tests
+- `bun run test:security` — Security and sandbox isolation tests
+- `bun run test:load` — High-throughput 100+ execution distributed load test
+
+---
+
+## Service Port Map
+
 | Service | Port | Description |
 |---|---|---|
-| Next.js Frontend | 3003 | Web workspace & UI |
-| Express REST API | 3000 | Auth, rooms, persistence |
-| Socket.io Sync Server | 3001 | Real-time code & chat sync |
-| Local Execution Daemon | 4000 | Native localized compilation & runner |
-| PostgreSQL | 5432 | Database |
+| Next.js Frontend | 3003 | Web workspace & Monaco Editor UI |
+| Express REST API | 3000 | Auth, rooms, commits, async execution dispatch |
+| Socket.IO Server | 3001 | Real-time code sync, presence, terminal events |
+| Redis | 6379 | Socket.IO adapter pub/sub, BullMQ queue, rate limiting |
+| PostgreSQL | 5432 | Persistent state (Users, Rooms, Files, Commits, Executions) |

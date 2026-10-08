@@ -1,0 +1,25 @@
+FROM alpine:3.20
+
+# Install build tools, compilers, runtimes
+RUN apk add --no-cache \
+    build-base \
+    gcc \
+    g++ \
+    python3 \
+    nodejs \
+    npm
+
+# Install TypeScript runner globally
+RUN npm install -g tsx typescript
+
+# Create restricted unprivileged sandbox user
+RUN addgroup -g 1001 sandbox && \
+    adduser -D -u 1001 -G sandbox -s /bin/sh sandbox
+
+# Setup workspace
+WORKDIR /workspace
+RUN chown -R sandbox:sandbox /workspace
+
+USER sandbox
+
+CMD ["/bin/sh"]

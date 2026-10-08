@@ -18,7 +18,6 @@ import {
   Globe,
   SlidersHorizontal,
 } from "lucide-react";
-import type { DiagnosticItem } from "@/lib/errorParser";
 import type { ExecutionResult } from "@/lib/localExecution";
 
 interface TerminalPanelProps {
@@ -78,30 +77,30 @@ export function TerminalPanel({
 
   return (
     <div
-      className={`border-t border-slate-800 bg-[#0c101a] flex flex-col shrink-0 transition-all duration-200 ${
+      className={`border-t border-[#D4D4D4] dark:border-[#27272A] bg-[#FFFFFF] dark:bg-[#000000] flex flex-col shrink-0 transition-all duration-150 ${
         isOpen ? "h-64 sm:h-72" : "h-10"
       }`}
     >
       {/* ── Terminal Header Bar ─────────────────────────────────────────── */}
-      <div className="h-10 px-4 flex items-center justify-between border-b border-slate-800/80 bg-[#0e1424] select-none shrink-0">
+      <div className="h-10 px-4 flex items-center justify-between border-b border-[#D4D4D4] dark:border-[#27272A] bg-[#F2F2F0] dark:bg-[#000000] select-none shrink-0">
         {/* Left: Title & Tabs */}
         <div className="flex items-center gap-2 sm:gap-4 overflow-x-auto">
           <button
             onClick={onToggle}
-            className="flex items-center gap-1.5 text-xs font-bold text-slate-200 hover:text-white transition-colors"
+            className="flex items-center gap-1.5 text-xs font-bold text-[#18181B] dark:text-[#FFFFFF] hover:text-[#7DB9E8] dark:hover:text-[#A8D8FF] transition-colors cursor-pointer"
           >
-            <TerminalIcon className="w-4 h-4 text-indigo-400" />
+            <TerminalIcon className="w-4 h-4 text-[#18181B] dark:text-[#A8D8FF]" />
             <span>Terminal</span>
           </button>
 
           {isOpen && (
-            <div className="flex items-center bg-[#141b30] p-0.5 rounded-lg border border-slate-800 text-[11px]">
+            <div className="flex items-center bg-[#FFFFFF] dark:bg-[#181818] p-0.5 rounded-lg border border-[#D4D4D4] dark:border-[#27272A] text-[11px]">
               <button
                 onClick={() => setActiveTab("output")}
-                className={`px-2.5 py-1 rounded-md font-medium transition-all ${
+                className={`px-2.5 py-1 rounded-md font-medium transition-all cursor-pointer ${
                   activeTab === "output"
-                    ? "bg-indigo-600 text-white shadow-sm"
-                    : "text-slate-400 hover:text-slate-200"
+                    ? "bg-[#F2F2F0] dark:bg-[#000000] text-[#18181B] dark:text-[#FFFFFF] shadow-xs font-semibold"
+                    : "text-[#52525B] dark:text-[#A1A1AA] hover:text-[#18181B] dark:hover:text-[#FFFFFF]"
                 }`}
               >
                 Output
@@ -109,20 +108,20 @@ export function TerminalPanel({
 
               <button
                 onClick={() => setActiveTab("diagnostics")}
-                className={`px-2.5 py-1 rounded-md font-medium flex items-center gap-1.5 transition-all ${
+                className={`px-2.5 py-1 rounded-md font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
                   activeTab === "diagnostics"
-                    ? "bg-indigo-600 text-white shadow-sm"
-                    : "text-slate-400 hover:text-slate-200"
+                    ? "bg-[#F2F2F0] dark:bg-[#000000] text-[#18181B] dark:text-[#FFFFFF] shadow-xs font-semibold"
+                    : "text-[#52525B] dark:text-[#A1A1AA] hover:text-[#18181B] dark:hover:text-[#FFFFFF]"
                 }`}
               >
                 <span>Diagnostics</span>
                 {errorCount > 0 && (
-                  <span className="px-1.5 py-0.2 rounded-full bg-red-500/20 text-red-300 text-[10px] font-bold border border-red-500/40">
+                  <span className="px-1.5 py-0.2 rounded-full bg-[#EF4444]/15 text-[#DC2626] dark:text-[#F87171] text-[10px] font-bold border border-[#EF4444]/30 font-mono">
                     {errorCount}
                   </span>
                 )}
                 {errorCount === 0 && warningCount > 0 && (
-                  <span className="px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-300 text-[10px] font-bold border border-amber-500/40">
+                  <span className="px-1.5 py-0.2 rounded-full bg-[#F59E0B]/15 text-[#D97706] dark:text-[#FBBF24] text-[10px] font-bold border border-[#F59E0B]/30 font-mono">
                     {warningCount}
                   </span>
                 )}
@@ -130,15 +129,15 @@ export function TerminalPanel({
 
               <button
                 onClick={() => setActiveTab("stdin")}
-                className={`px-2.5 py-1 rounded-md font-medium flex items-center gap-1 transition-all ${
+                className={`px-2.5 py-1 rounded-md font-medium flex items-center gap-1 transition-all cursor-pointer ${
                   activeTab === "stdin"
-                    ? "bg-indigo-600 text-white shadow-sm"
-                    : "text-slate-400 hover:text-slate-200"
+                    ? "bg-[#F2F2F0] dark:bg-[#000000] text-[#18181B] dark:text-[#FFFFFF] shadow-xs font-semibold"
+                    : "text-[#52525B] dark:text-[#A1A1AA] hover:text-[#18181B] dark:hover:text-[#FFFFFF]"
                 }`}
               >
                 <SlidersHorizontal className="w-3 h-3" />
                 <span>Custom Input</span>
-                {stdin.trim() && <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" />}
+                {stdin.trim() && <span className="w-1.5 h-1.5 rounded-full bg-[#A8D8FF]" />}
               </button>
             </div>
           )}
@@ -148,24 +147,24 @@ export function TerminalPanel({
         <div className="hidden md:flex items-center gap-2.5 text-xs">
           {daemonActive ? (
             <div
-              title="Connected to native local execution daemon"
-              className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-emerald-950/60 border border-emerald-700/50 text-emerald-300 text-[11px]"
+              title="Execution running via isolated Docker container on daemon"
+              className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[#10B981]/10 border border-[#10B981]/25 text-[#059669] dark:text-[#34D399] text-[11px] font-mono"
             >
-              <Cpu className="w-3 h-3 text-emerald-400" />
-              <span>Local Daemon (Native)</span>
+              <Cpu className="w-3 h-3 text-[#10B981]" />
+              <span>Docker Sandbox (Native)</span>
             </div>
           ) : (
             <div
-              title="Running securely in browser sandbox (Wasm / Web Worker)"
-              className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-sky-950/60 border border-sky-700/50 text-sky-300 text-[11px]"
+              title="Running in browser fallback worker sandbox"
+              className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[#E8E1D5]/40 dark:bg-[#18181B] border border-[#DCD6CA] dark:border-[#27272A] text-[#71717A] dark:text-[#E8E1D5] text-[11px] font-mono"
             >
-              <Globe className="w-3 h-3 text-sky-400" />
-              <span>In-Browser Client</span>
+              <Globe className="w-3 h-3 text-[#A8D8FF]" />
+              <span>In-Browser Sandbox</span>
             </div>
           )}
 
           {isRunning && (
-            <span className="flex items-center gap-1.5 text-amber-400 text-[11px] font-medium">
+            <span className="flex items-center gap-1.5 text-[#D97706] text-[11px] font-medium font-mono">
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
               Executing…
             </span>
@@ -174,23 +173,23 @@ export function TerminalPanel({
           {!isRunning && executionResult && (
             <div className="flex items-center gap-2">
               {executionResult.exitCode === 0 ? (
-                <span className="flex items-center gap-1 text-emerald-400 text-[11px] font-medium">
+                <span className="flex items-center gap-1 text-[#059669] dark:text-[#34D399] text-[11px] font-mono font-medium">
                   <CheckCircle2 className="w-3.5 h-3.5" />
                   Exit Code: 0
                 </span>
               ) : executionResult.exitCode === 124 ? (
-                <span className="flex items-center gap-1 text-amber-400 text-[11px] font-medium">
+                <span className="flex items-center gap-1 text-[#D97706] text-[11px] font-mono font-medium">
                   <AlertTriangle className="w-3.5 h-3.5" />
                   Time Limit Exceeded
                 </span>
               ) : (
-                <span className="flex items-center gap-1 text-red-400 text-[11px] font-medium">
+                <span className="flex items-center gap-1 text-[#DC2626] dark:text-[#F87171] text-[11px] font-mono font-medium">
                   <AlertCircle className="w-3.5 h-3.5" />
                   Exit Code: {executionResult.exitCode}
                 </span>
               )}
 
-              <span className="text-slate-500 font-mono text-[10px]">
+              <span className="text-[#71717A] dark:text-[#52525B] font-mono text-[10px]">
                 {executionResult.executionTimeMs}ms
               </span>
             </div>
@@ -204,14 +203,14 @@ export function TerminalPanel({
               <button
                 onClick={handleCopy}
                 title="Copy terminal logs"
-                className="p-1.5 rounded-md text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
+                className="p-1.5 rounded-lg text-[#71717A] dark:text-[#A1A1AA] hover:text-[#111111] dark:hover:text-[#FFFFFF] hover:bg-[#E8E1D5]/40 dark:hover:bg-[#18181B] transition-colors cursor-pointer"
               >
-                {isCopied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                {isCopied ? <Check className="w-3.5 h-3.5 text-[#10B981]" /> : <Copy className="w-3.5 h-3.5" />}
               </button>
               <button
                 onClick={onClear}
                 title="Clear terminal"
-                className="p-1.5 rounded-md text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
+                className="p-1.5 rounded-lg text-[#71717A] dark:text-[#A1A1AA] hover:text-[#111111] dark:hover:text-[#FFFFFF] hover:bg-[#E8E1D5]/40 dark:hover:bg-[#18181B] transition-colors cursor-pointer"
               >
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
@@ -220,7 +219,7 @@ export function TerminalPanel({
 
           <button
             onClick={onToggle}
-            className="p-1.5 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+            className="p-1.5 rounded-lg text-[#71717A] dark:text-[#A1A1AA] hover:text-[#111111] dark:hover:text-[#FFFFFF] hover:bg-[#E8E1D5]/40 dark:hover:bg-[#18181B] transition-colors cursor-pointer"
           >
             {isOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
           </button>
@@ -229,33 +228,33 @@ export function TerminalPanel({
 
       {/* ── Terminal Content Area ───────────────────────────────────────── */}
       {isOpen && (
-        <div className="flex-1 overflow-hidden bg-[#080c14] flex flex-col">
+        <div className="flex-1 overflow-hidden bg-[#FFFFFF] dark:bg-[#000000] flex flex-col text-[#18181B] dark:text-[#F5F5F5]">
           {/* TAB 1: Console Output */}
           {activeTab === "output" && (
             <div className="flex-1 p-4 font-mono text-xs overflow-y-auto select-text leading-relaxed space-y-2">
               {isRunning ? (
-                <div className="flex items-center gap-2 text-slate-400 py-4">
-                  <Loader2 className="w-4 h-4 animate-spin text-indigo-400" />
-                  <span>Executing code on your local system...</span>
+                <div className="flex items-center gap-2 text-[#71717A] dark:text-[#A1A1AA] py-4">
+                  <Loader2 className="w-4 h-4 animate-spin text-[#A8D8FF]" />
+                  <span>Executing code in isolated container...</span>
                 </div>
               ) : !executionResult ? (
-                <div className="text-slate-500 select-none py-6 text-center">
+                <div className="text-[#71717A] dark:text-[#52525B] select-none py-6 text-center">
                   <TerminalIcon className="w-6 h-6 mx-auto mb-2 opacity-40" />
-                  <p>Ready. Press <span className="text-emerald-400 font-semibold">Run</span> to execute locally.</p>
-                  <p className="text-[11px] text-slate-600 mt-1">
-                    No remote Docker required. Fully decentralized execution.
+                  <p>Ready. Click <span className="text-[#059669] dark:text-[#34D399] font-semibold">Run</span> to execute sandbox.</p>
+                  <p className="text-[11px] text-[#71717A] dark:text-[#52525B] mt-1 font-mono">
+                    Strict isolation: 256MB memory cap · 1 CPU · Network: None
                   </p>
                 </div>
               ) : (
                 <div className="space-y-3">
                   {/* Compiler Logs */}
                   {executionResult.compilerLog && (
-                    <div className="p-3 rounded-lg bg-[#0e1424] border border-slate-800/80">
-                      <div className="text-[11px] font-bold text-indigo-300 uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
-                        <span className="w-1.5 h-1.5 rounded-full bg-indigo-400" />
+                    <div className="p-3 rounded-xl bg-[#F2F2F0] dark:bg-[#111111] border border-[#D4D4D4] dark:border-[#27272A]">
+                      <div className="text-[11px] font-bold text-[#18181B] dark:text-[#A8D8FF] uppercase tracking-wider mb-1.5 flex items-center gap-1.5 font-mono">
+                        <span className="w-1.5 h-1.5 rounded-full bg-[#A8D8FF]" />
                         Compiler Diagnostics
                       </div>
-                      <div className="whitespace-pre-wrap text-slate-300 font-mono text-[11px]">
+                      <div className="whitespace-pre-wrap text-[#18181B] dark:text-[#E8E1D5] font-mono text-[11px]">
                         {executionResult.compilerLog}
                       </div>
                     </div>
@@ -264,10 +263,10 @@ export function TerminalPanel({
                   {/* Standard Output */}
                   {executionResult.stdout && (
                     <div>
-                      <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">
+                      <div className="text-[10px] font-bold text-[#71717A] dark:text-[#52525B] uppercase tracking-wider mb-1 font-mono">
                         stdout
                       </div>
-                      <div className="whitespace-pre-wrap text-emerald-300 bg-emerald-950/10 p-3 rounded-lg border border-emerald-900/30">
+                      <div className="whitespace-pre-wrap text-[#065F46] dark:text-[#34D399] bg-[#10B981]/10 p-3 rounded-xl border border-[#10B981]/25 font-mono">
                         {executionResult.stdout}
                       </div>
                     </div>
@@ -276,11 +275,11 @@ export function TerminalPanel({
                   {/* Standard Error */}
                   {executionResult.stderr && (
                     <div>
-                      <div className="text-[10px] font-bold text-red-400 uppercase tracking-wider mb-1 flex items-center gap-1">
-                        <AlertCircle className="w-3 h-3 text-red-400" />
-                        stderr & runtime errors
+                      <div className="text-[10px] font-bold text-[#DC2626] dark:text-[#F87171] uppercase tracking-wider mb-1 flex items-center gap-1 font-mono">
+                        <AlertCircle className="w-3 h-3 text-[#DC2626] dark:text-[#F87171]" />
+                        stderr & runtime diagnostics
                       </div>
-                      <div className="whitespace-pre-wrap text-red-300 bg-red-950/20 p-3 rounded-lg border border-red-900/40">
+                      <div className="whitespace-pre-wrap text-[#991B1B] dark:text-[#F87171] bg-[#EF4444]/10 p-3 rounded-xl border border-[#EF4444]/25 font-mono">
                         {executionResult.stderr}
                       </div>
                     </div>
@@ -288,13 +287,13 @@ export function TerminalPanel({
 
                   {/* Clean exit with no output */}
                   {!executionResult.stdout && !executionResult.stderr && !executionResult.compilerLog && (
-                    <div className="p-3 rounded-lg bg-emerald-950/20 border border-emerald-900/30 text-emerald-300 text-xs">
-                      ✓ Program executed cleanly with exit code {executionResult.exitCode} (no console output).
+                    <div className="p-3 rounded-xl bg-[#10B981]/10 border border-[#10B981]/25 text-[#059669] dark:text-[#34D399] text-xs font-mono">
+                      ✓ Execution finished cleanly with exit code {executionResult.exitCode} (no stdout).
                     </div>
                   )}
 
                   {/* Execution footer banner */}
-                  <div className="pt-2 text-[10px] text-slate-500 border-t border-slate-800/50 flex flex-wrap items-center justify-between gap-2">
+                  <div className="pt-2 text-[10px] text-[#71717A] dark:text-[#52525B] border-t border-[#DCD6CA] dark:border-[#27272A] flex flex-wrap items-center justify-between gap-2 font-mono">
                     <span>{executionResult.runtimeDetails}</span>
                     <span>Elapsed: {executionResult.executionTimeMs}ms • Exit code: {executionResult.exitCode}</span>
                   </div>
@@ -307,11 +306,11 @@ export function TerminalPanel({
           {activeTab === "diagnostics" && (
             <div className="flex-1 p-3 overflow-y-auto space-y-2">
               {diagnostics.length === 0 ? (
-                <div className="py-10 text-center text-slate-500">
-                  <CheckCircle2 className="w-7 h-7 mx-auto mb-2 text-emerald-400 opacity-80" />
-                  <p className="text-xs font-semibold text-slate-300">No Syntax Errors or Warnings</p>
-                  <p className="text-[11px] text-slate-500 mt-0.5">
-                    Your code compiled and executed cleanly without compiler diagnostics.
+                <div className="py-10 text-center text-[#71717A] dark:text-[#52525B]">
+                  <CheckCircle2 className="w-7 h-7 mx-auto mb-2 text-[#10B981] opacity-80" />
+                  <p className="text-xs font-semibold text-[#111111] dark:text-[#F5F3EE]">No Diagnostics Reported</p>
+                  <p className="text-[11px] text-[#71717A] dark:text-[#52525B] mt-0.5 font-mono">
+                    Your code compiled and executed cleanly without compiler errors or warnings.
                   </p>
                 </div>
               ) : (
@@ -320,27 +319,27 @@ export function TerminalPanel({
                     key={diag.id}
                     className={`p-3 rounded-xl border transition-all text-xs ${
                       diag.severity === "error"
-                        ? "bg-red-950/20 border-red-800/40 hover:border-red-700/60"
+                        ? "bg-[#EF4444]/10 border-[#EF4444]/25"
                         : diag.severity === "warning"
-                        ? "bg-amber-950/20 border-amber-800/40 hover:border-amber-700/60"
-                        : "bg-slate-900 border-slate-800"
+                        ? "bg-[#F59E0B]/10 border-[#F59E0B]/25"
+                        : "bg-white dark:bg-[#111111] border-[#DCD6CA] dark:border-[#27272A]"
                     }`}
                   >
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex items-center gap-2">
                         {diag.severity === "error" ? (
-                          <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                          <AlertCircle className="w-4 h-4 text-[#DC2626] dark:text-[#F87171] shrink-0" />
                         ) : diag.severity === "warning" ? (
-                          <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                          <AlertTriangle className="w-4 h-4 text-[#D97706] dark:text-[#FBBF24] shrink-0" />
                         ) : (
-                          <Info className="w-4 h-4 text-sky-400 shrink-0" />
+                          <Info className="w-4 h-4 text-[#7DB9E8] shrink-0" />
                         )}
-                        <span className="font-semibold text-slate-200">{diag.message}</span>
+                        <span className="font-semibold text-[#111111] dark:text-[#F5F3EE]">{diag.message}</span>
                       </div>
 
                       <button
                         onClick={() => onJumpToLine(diag.line, diag.column)}
-                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-indigo-600 text-slate-200 hover:text-white text-[11px] font-medium transition-colors shrink-0"
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#E8E1D5]/60 dark:bg-[#18181B] hover:bg-[#111111] dark:hover:bg-[#27272A] text-[#111111] dark:text-[#F5F3EE] hover:text-white text-[11px] font-mono transition-colors shrink-0 cursor-pointer"
                         title="Highlight line in editor"
                       >
                         <span>Line {diag.line}{diag.column ? `:${diag.column}` : ""}</span>
@@ -349,7 +348,7 @@ export function TerminalPanel({
                     </div>
 
                     {diag.source && (
-                      <div className="mt-2 p-2 rounded-md bg-[#05080f] font-mono text-[11px] text-red-300 whitespace-pre overflow-x-auto border border-red-950">
+                      <div className="mt-2 p-2 rounded-lg bg-black/5 dark:bg-black/50 font-mono text-[11px] text-[#DC2626] dark:text-[#F87171] whitespace-pre overflow-x-auto border border-[#EF4444]/20">
                         {diag.source}
                       </div>
                     )}
@@ -362,15 +361,15 @@ export function TerminalPanel({
           {/* TAB 3: Stdin custom input */}
           {activeTab === "stdin" && (
             <div className="flex-1 p-3 flex flex-col">
-              <label className="text-[11px] font-semibold text-slate-400 mb-1 flex items-center justify-between">
-                <span>Standard Input (stdin for competitive programming test cases)</span>
-                <span className="text-[10px] text-slate-500 font-normal">Passed into program during execution</span>
+              <label className="text-[11px] font-semibold text-[#111111] dark:text-[#F5F3EE] mb-1 flex items-center justify-between">
+                <span>Standard Input (stdin stream)</span>
+                <span className="text-[10px] text-[#71717A] dark:text-[#52525B] font-mono">Piped to process on execution</span>
               </label>
               <textarea
                 value={stdin}
                 onChange={(e) => onStdinChange(e.target.value)}
-                placeholder="Enter input here (e.g. array size, integers, strings for cin or sys.stdin)..."
-                className="flex-1 w-full p-3 rounded-xl bg-[#0e1424] border border-slate-800 text-xs font-mono text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none"
+                placeholder="Enter input here (e.g. integer count, test matrix, input lines)..."
+                className="flex-1 w-full p-3 rounded-xl bg-white dark:bg-[#111111] border border-[#DCD6CA] dark:border-[#27272A] text-xs font-mono text-[#111111] dark:text-[#F5F3EE] placeholder-[#71717A] dark:placeholder-[#52525B] focus:outline-none focus:ring-2 focus:ring-[#A8D8FF]/20 focus:border-[#7DB9E8] dark:focus:border-[#A8D8FF] resize-none transition-colors"
               />
             </div>
           )}

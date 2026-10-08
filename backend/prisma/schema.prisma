@@ -10,6 +10,7 @@ datasource db {
   provider = "postgresql"
 }
 
+// ── User Accounts & Authentication ──────────────────────────────────────────
 model User {
   id            String    @id @default(cuid())
   name          String?
@@ -24,7 +25,6 @@ model User {
   sessions      Session[]
   rooms         Room[]    @relation("CreatedRooms")
   commits       Commit[]
-  messages      Message[]
 }
 
 model Account {
@@ -62,39 +62,46 @@ model VerificationToken {
   @@unique([identifier, token])
 }
 
+// ── Workspaces & Project Metadata ───────────────────────────────────────────
 model Room {
   id        String   @id @default(uuid())
-  title     String   @default("Untitled Room")
+  title     String   @default("Untitled Workspace")
   // Legacy single-file fields — kept for backward compat; live state is in File[]
   code      String   @default("// Welcome to CodeCollab!\n") @db.Text
   language  String   @default("cpp")
+  branch    String   @default("main")
+  repoName  String?
+  isPrivate Boolean  @default(false)
   creatorId String?
   creator   User?    @relation("CreatedRooms", fields: [creatorId], references: [id], onDelete: SetNull)
   files     File[]
   commits   Commit[]
-  messages  Message[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([creatorId])
 }
 
-// ── Multi-file workspace ────────────────────────────────────────────────────
+// ── Workspace Files (Latest Authoritative State) ─────────────────────────────
 // Each File belongs to a Room. `path` is the logical path within the workspace
 // (e.g. "/main.cpp", "/src/utils.ts"). @@unique ensures no duplicate paths per room.
 model File {
-  id        String   @id @default(cuid())
-  roomId    String
-  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
-  name      String            // display name  e.g. "main.cpp"
-  path      String            // logical path  e.g. "/main.cpp"
-  content   String   @db.Text
-  language  String   @default("cpp")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id         String      @id @default(cuid())
+  roomId     String
+  room       Room        @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  name       String            // display name  e.g. "main.cpp"
+  path       String            // logical path  e.g. "/main.cpp"
+  content    String      @db.Text
+  language   String      @default("cpp")
+  version    Int         @default(1)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
 
   @@index([roomId])
   @@unique([roomId, path])
 }
 
+// ── Milestone Snapshots (Commits & Rollbacks) ───────────────────────────────
 model Commit {
   id            String   @id @default(cuid())
   message       String
@@ -111,32 +118,4 @@ model Commit {
   createdAt     DateTime @default(now())
 
   @@index([roomId])
-}
-
-model Message {
-  id         String   @id @default(cuid())
-  content    String   @db.Text
-  roomId     String
-  room       Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
-  userId     String?
-  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
-  senderName String   @default("Anonymous")
-  createdAt  DateTime @default(now())
-
-  @@index([roomId])
-}
-
-model Submissions {
-  id        String           @id @default(uuid())
-  code      String           @db.Text
-  language  String
-  status    SubmissionStatus @default(Processing)
-  output    String?          @db.Text
-  createdAt DateTime         @default(now())
-}
-
-enum SubmissionStatus {
-  Processing
-  Success
-  Failure
 }
