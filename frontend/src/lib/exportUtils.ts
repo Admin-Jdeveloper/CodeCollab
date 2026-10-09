@@ -164,7 +164,7 @@ function sanitizeName(name: string): string {
  * - Multiple files: packages all files in a clean zip archive (e.g. my-project.zip).
  */
 export async function exportWorkspaceFiles(opts: ExportWorkspaceOptions): Promise<{ count: number; filename: string }> {
-  const { files, roomTitle = "CodeCollab", roomId } = opts;
+  const { files, roomTitle = "CodeCollab" } = opts;
 
   if (!files || files.length === 0) {
     throw new Error("No files in workspace to export");

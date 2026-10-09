@@ -5,16 +5,10 @@ import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 import Link from "next/link";
 import {
-  Zap,
   ArrowRight,
-  Cpu,
   LogIn,
   Share2,
-  History,
-  Terminal,
   Loader2,
-  Check,
-  Layers,
   GitBranch,
   FolderCode,
   Trash2,
@@ -25,9 +19,6 @@ import {
   Plus,
   Sparkles,
   ArrowDown,
-  Users,
-  Play,
-  CheckCircle2,
 } from "lucide-react";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { Button } from "@/components/ui/button";
@@ -164,9 +155,7 @@ export default function LandingPage() {
       fetchWorkspaces();
     } else {
       setWorkspaces([]);
-      if (activeTab === "workspaces") {
-        setActiveTab("create");
-      }
+      setActiveTab((prev) => (prev === "workspaces" ? "create" : prev));
     }
   }, [session?.user, fetchWorkspaces]);
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { LogOut, Settings, User } from "lucide-react";
+import { LogOut, Settings } from "lucide-react";
 import { signOut } from "next-auth/react";
 import React, { useEffect, useRef, useState } from "react";
 

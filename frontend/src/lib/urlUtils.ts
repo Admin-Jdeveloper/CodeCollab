@@ -7,13 +7,18 @@
  */
 
 export function getBackendUrl(): string {
-  const envUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
+  const envUrl = process.env.NEXT_PUBLIC_BACKEND_URL?.trim().replace(/\/+$/, "");
   // If a production or custom URL is configured in env (not localhost), strictly prioritize it
   if (envUrl && !envUrl.includes("localhost") && !envUrl.includes("127.0.0.1")) {
     return envUrl;
   }
   // In browser, if accessed via LAN IP or custom host during local/testing development, bind to that host's port 3000
-  if (typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
+  if (
+    typeof window !== "undefined" &&
+    window.location.hostname !== "localhost" &&
+    window.location.hostname !== "127.0.0.1" &&
+    !window.location.hostname.endsWith(".vercel.app")
+  ) {
     return `${window.location.protocol}//${window.location.hostname}:3000`;
   }
   if (envUrl) {
@@ -22,17 +27,22 @@ export function getBackendUrl(): string {
   if (typeof window !== "undefined") {
     return `${window.location.protocol}//${window.location.hostname}:3000`;
   }
-  return process.env.BACKEND_URL || "http://127.0.0.1:3000";
+  return (process.env.BACKEND_URL || "http://127.0.0.1:3000").replace(/\/+$/, "");
 }
 
 export function getSocketUrl(): string {
-  const envUrl = process.env.NEXT_PUBLIC_SOCKET_URL;
+  const envUrl = process.env.NEXT_PUBLIC_SOCKET_URL?.trim().replace(/\/+$/, "");
   // If a production or custom URL is configured in env (not localhost), strictly prioritize it
   if (envUrl && !envUrl.includes("localhost") && !envUrl.includes("127.0.0.1")) {
     return envUrl;
   }
   // In browser, if accessed via LAN IP or custom host during local/testing development, bind to that host's port 3001
-  if (typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
+  if (
+    typeof window !== "undefined" &&
+    window.location.hostname !== "localhost" &&
+    window.location.hostname !== "127.0.0.1" &&
+    !window.location.hostname.endsWith(".vercel.app")
+  ) {
     return `${window.location.protocol}//${window.location.hostname}:3001`;
   }
   if (envUrl) {

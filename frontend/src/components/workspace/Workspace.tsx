@@ -3,14 +3,13 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import dynamic from "next/dynamic";
 import type { editor } from "monaco-editor";
-import { useSession, signOut } from "next-auth/react";
+import { useSession } from "next-auth/react";
 import { useTheme } from "next-themes";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { Session } from "next-auth";
 import { getBackendUrl } from "@/lib/urlUtils";
 import {
-  Code2,
   Share2,
   Copy,
   Check,
@@ -25,15 +24,9 @@ import {
   FolderOpen,
   FileCode2,
   ChevronRight,
-  ChevronDown,
   LogIn,
-  LogOut,
   GitBranch,
   Settings,
-  Keyboard,
-  Sliders,
-  Shield,
-  User,
 } from "lucide-react";
 import {
   useRoomSocket,
@@ -804,13 +797,16 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
   const langLabel =
     { cpp: "C++", javascript: "JavaScript", python: "Python" }[activeLanguage] ?? activeLanguage;
 
+  const handleExecuteRef = useRef(handleExecute);
+  handleExecuteRef.current = handleExecute;
+
   // Global keyboard shortcuts: Ctrl/Cmd+Enter -> Run, Ctrl/Cmd+S -> Save Snapshot
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
         e.preventDefault();
         if (!isExecutingRef.current && activeFile) {
-          handleExecute();
+          handleExecuteRef.current();
         }
       }
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
