@@ -1,11 +1,11 @@
+import "./env";
 import Redis, { type RedisOptions } from "ioredis";
-
-const rawRedisUrl = process.env.REDIS_URL?.trim();
 
 function resolveRedisConfig(): {
   connectionOptions: RedisOptions;
   connectionString?: string;
 } {
+  const rawRedisUrl = process.env.REDIS_URL?.trim();
   if (rawRedisUrl) {
     const isTls = rawRedisUrl.startsWith("rediss://");
     try {

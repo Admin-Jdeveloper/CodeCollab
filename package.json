@@ -4,6 +4,7 @@
   "scripts": {
     "worker": "bun run backend/execution/worker.ts",
     "daemon": "bun run local-runner/daemon.ts",
+    "daemon:deployed": "bun run local-runner/daemon-cloud.ts",
     "dev:frontend": "cd frontend && bun run dev",
     "dev:backend": "cd backend && bun run dev",
     "dev:socket": "cd backend && bun run dev:socket",

@@ -985,7 +985,7 @@ async function flushToDB(roomId: string) {
 // START & GRACEFUL SHUTDOWN
 // ============================================================
 
-const SOCKET_PORT = Number(process.env.PORT) || Number(process.env.SOCKET_PORT) || 3001;
+const SOCKET_PORT = Number(process.env.SOCKET_PORT) || Number(process.env.PORT) || 3001;
 
 httpServer.listen(SOCKET_PORT, () => {
   console.log(`[CodeCollab Socket.IO] 🔌 Sync server running on port ${SOCKET_PORT} (PID: ${process.pid})`);
