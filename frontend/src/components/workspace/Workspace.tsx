@@ -76,10 +76,11 @@ function langFromMonaco(monacoLang: string): string {
 const STARTER_CONTENT: Record<string, string> = {
   cpp: `#include <iostream>
 #include <vector>
-using namespace std;
+#include <string>
 
 int main() {
-    cout << "🚀 CodeCollab – Real-Time Collaborative Workspace (C++)" << endl;
+    std::cout << "🚀 CodeCollab C++ Environment Active\\n";
+    std::cout << "Collaborate and run code locally!\\n";
     return 0;
 }
 `,
@@ -90,13 +91,14 @@ int main() {
     return 0;
 }
 `,
-  javascript: `// 🚀 CodeCollab — JavaScript Workspace
+  javascript: `// 🚀 CodeCollab JavaScript Environment
 function main() {
-    console.log("CodeCollab: synchronized in real-time!");
-    const primes = Array.from({ length: 10 }, (_, i) => i + 2)
-        .filter(n => Array.from({ length: n - 2 }, (_, i) => i + 2).every(d => n % d !== 0));
-    console.log("First 8 primes:", primes.slice(0, 8));
+    console.log("CodeCollab JavaScript workspace initialized!");
+    const items = [1, 2, 3, 4, 5];
+    const sum = items.reduce((acc, curr) => acc + curr, 0);
+    console.log("Sum calculation:", sum);
 }
+
 main();
 `,
   typescript: `// 🚀 CodeCollab — TypeScript Workspace
@@ -107,11 +109,11 @@ function main(): void {
 }
 main();
 `,
-  python: `# 🚀 CodeCollab — Python Workspace
+  python: `# 🚀 CodeCollab Python Environment
 def main():
-    print("CodeCollab: synchronized in real-time!")
-    primes = [n for n in range(2, 30) if all(n % d != 0 for d in range(2, n))]
-    print("Primes:", primes)
+    print("Welcome to CodeCollab Python Workspace!")
+    nums = [1, 2, 3, 4, 5]
+    print("Numbers:", nums)
 
 if __name__ == "__main__":
     main()
@@ -371,9 +373,12 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     getSocket,
   } = useRoomSocket(roomId, currentUserId, currentUserName, {
     onRoomState: ({ files: remoteFiles }) => {
+      // Mark room joined in Yjs manager so all providers can synchronize safely
+      yjsManagerRef.current?.markRoomJoined(true);
+
       // Warm up Yjs document and provider instances for all workspace files
       for (const f of remoteFiles) {
-        yjsManagerRef.current?.getOrCreate(f.path);
+        yjsManagerRef.current?.getOrCreate(f.path, f.content);
       }
 
       const isActivelyEditing = Date.now() - lastLocalEditTimeRef.current < 3000;
@@ -407,37 +412,16 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
 
     onCodeUpdate: (filePath, remoteCode, senderId) => {
       if (senderId === currentUserId) return;
-      // When Yjs is active for this file, skip legacy full-string replace
-      const yjsManager = yjsManagerRef.current;
-      if (yjsManager && yjsManager.getText(filePath)) {
-        return;
-      }
-      updateFileContent(filePath, remoteCode);
+      // Yjs manages real-time collaborative document state conflict-free.
+      // Update local file metadata cache only; never execute legacy string replacements on Monaco.
+      setFiles((prev) =>
+        prev.map((f) => (f.path === filePath ? { ...f, content: remoteCode } : f))
+      );
     },
 
-    onSyncRequired: ({ filePath, content }) => {
-      const yjsManager = yjsManagerRef.current;
-      if (yjsManager && yjsManager.getText(filePath)) {
-        return; // Reconciled deterministically by Yjs CRDT
-      }
-      const isCurrentlyActive = filePath === activeFilePathRef.current;
-      const isActivelyTyping = isCurrentlyActive && (Date.now() - lastLocalEditTimeRef.current < 2500);
-
-      if (isActivelyTyping && editorRef.current) {
-        // Preserve local editor keystrokes; re-emit with authoritative version
-        const currentModelText = editorRef.current.getModel()?.getValue();
-        if (currentModelText && currentModelText !== content) {
-          emitCodeChange(filePath, currentModelText, activeLanguage);
-          return;
-        }
-      }
-
-      updateFileContent(filePath, content);
-      const now = Date.now();
-      if (now - lastSyncToastRef.current > 5000) {
-        lastSyncToastRef.current = now;
-        toast.warning("Synchronized with authoritative server version");
-      }
+    onSyncRequired: () => {
+      // Reconciled deterministically by Yjs CRDT state vectors.
+      // Legacy OT code_change re-emissions are completely bypassed.
     },
 
     onExecutionEvent: (event) => {
@@ -689,28 +673,23 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
 
       const existingFile = filesRef.current.find((f) => f.path === filePath);
       const defaultContent = STARTER_CONTENT[language] || `// ${filePath.replace(/^\//, "")}\n`;
-      const initialText = existingFile?.content || defaultContent;
+      const placeholderText = existingFile?.content || defaultContent;
 
-      const { doc } = yjsManager.getOrCreate(filePath, initialText);
       const uri = monaco.Uri.parse(`inmemory://workspace/${filePath.replace(/^\//, "")}`);
       let model = monaco.editor.getModel(uri);
-      const docText = doc.getText("monaco").toString();
-      const textForModel = docText || initialText;
 
       if (!model || model.isDisposed()) {
-        model = monaco.editor.createModel(textForModel, langFromMonaco(language), uri);
+        const docText = yjsManager.getText(filePath);
+        model = monaco.editor.createModel(docText || placeholderText, langFromMonaco(language), uri);
       } else {
         monaco.editor.setModelLanguage(model, langFromMonaco(language));
-        if (textForModel && model.getValue() !== textForModel) {
-          model.setValue(textForModel);
-        }
       }
 
       if (ed.getModel() !== model) {
         ed.setModel(model);
       }
 
-      yjsManager.bindMonaco(filePath, ed, model, textForModel);
+      yjsManager.bindMonaco(filePath, ed, model, placeholderText);
     },
     []
   );
@@ -791,7 +770,7 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     const content = STARTER_CONTENT[language] ?? `// ${name}\n`;
 
     // 1. Pre-seed local Yjs document with starter template
-    yjsManagerRef.current?.getOrCreate(path, content);
+    yjsManagerRef.current?.createFile(path, content);
 
     // 2. Emit file_created to server and peers
     emitFileCreated(path, name, language, content);

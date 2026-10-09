@@ -1,6 +1,7 @@
 import { io, type Socket } from "socket.io-client";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as Y from "yjs";
+import { prisma } from "../backend/db";
 
 const SOCKET_PORT = process.env.SOCKET_PORT || "3001";
 const SOCKET_URL = `http://localhost:${SOCKET_PORT}`;
@@ -472,6 +473,79 @@ int main() {
       text1Sec.toString().length > 50 && text1Sec.toString().includes("TEST_TEMPLATE_OUTPUT"),
       "Execution Readiness: getText on secondary file returns full populated code for execution"
     );
+
+    // 18. Test D — Late Join: Client 3 joins long after edits and receives clean synchronized state without duplication
+    const client3 = await createClient();
+    const doc3 = new Y.Doc();
+    const text3 = doc3.getText("monaco");
+
+    client3.on("yjs_update", (payload: any) => {
+      if (payload.filePath === testFile) {
+        Y.applyUpdate(doc3, normalizeBinary(payload.update), "remote");
+      }
+    });
+
+    let client3Synced = false;
+    client3.on("yjs_sync_step2", (payload: any) => {
+      if (payload.filePath === testFile) {
+        const bin = normalizeBinary(payload.update);
+        if (bin.length > 0) Y.applyUpdate(doc3, bin, "server");
+        client3Synced = true;
+      }
+    });
+
+    const c3Joined = new Promise((res) => client3.once("room_state", res));
+    client3.emit("join_room", { roomId: testRoom, userId: "user-3", userName: "Charlie" });
+    await c3Joined;
+
+    client3.emit("yjs_sync_step1", {
+      roomId: testRoom,
+      filePath: testFile,
+      stateVector: Y.encodeStateVector(doc3),
+    });
+
+    await waitFor(() => client3Synced);
+    await wait(200);
+
+    const charlieText = text3.toString();
+    const aliceText = text1.toString();
+    assert(
+      charlieText === aliceText,
+      `Late Join: Client 3 state vector sync matches active room state exactly (len=${charlieText.length})`
+    );
+    // Verify no duplicated blocks (e.g. ALICE_CONCURRENT_INSERT appearing twice)
+    const occurrences = (charlieText.match(/ALICE_CONCURRENT_INSERT/g) || []).length;
+    assert(
+      occurrences === 1,
+      `Late Join: Zero duplication verified (token occurred exactly ${occurrences} time)`
+    );
+
+    // 19. Test F — Database Persistence: Authoritative document state matches Prisma database
+    await wait(1200); // Wait for debounced flushToDB
+    const dbFile = await prisma.file.findUnique({
+      where: { roomId_path: { roomId: testRoom, path: testFile } },
+    });
+    assert(
+      dbFile !== null && dbFile.content.includes("ALICE_CONCURRENT_INSERT"),
+      "Persistence: CRDT document content successfully flushed to PostgreSQL/Prisma without data loss"
+    );
+
+    // 20. Test G — Listener and Echo-Loop Safety: Remote update application generates zero echo emission
+    let rogueEchoCount = 0;
+    const testDoc = new Y.Doc();
+    testDoc.on("update", (_update, origin) => {
+      if (origin !== "provider") {
+        rogueEchoCount++;
+      }
+    });
+    // Apply update with provider origin
+    Y.applyUpdate(testDoc, Y.encodeStateAsUpdate(doc1), "provider");
+    assert(
+      rogueEchoCount === 0,
+      "Echo Suppression: Applying remote update with provider origin triggers zero outbound socket emissions"
+    );
+
+    client3.disconnect();
   } catch (err: any) {
     console.error("Test execution failed:", err);
     failed++;

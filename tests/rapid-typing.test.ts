@@ -8,16 +8,24 @@ function wait(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function connectSocket(url: string): Promise<Socket> {
-  return new Promise((resolve, reject) => {
-    const s = io(url, {
-      transports: ["websocket"],
-      reconnection: false,
-      timeout: 5000,
-    });
-    s.on("connect", () => resolve(s));
-    s.on("connect_error", (err) => reject(err));
-  });
+async function connectSocket(url: string, retries = 5): Promise<Socket> {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const s = await new Promise<Socket>((resolve, reject) => {
+        const sock = io(url, {
+          transports: ["websocket", "polling"],
+          reconnection: false,
+          timeout: 4000,
+        });
+        sock.on("connect", () => resolve(sock));
+        sock.on("connect_error", (err) => reject(err));
+      });
+      return s;
+    } catch {
+      await wait(600);
+    }
+  }
+  throw new Error(`Failed to connect to ${url} after ${retries} attempts`);
 }
 
 async function runRapidTypingTestSuite() {

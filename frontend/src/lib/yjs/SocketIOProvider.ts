@@ -5,7 +5,7 @@ import type { Socket } from "socket.io-client";
 
 /**
  * Normalizes various binary representations into a standard Uint8Array.
- * Handles Uint8Array, ArrayBuffer, Node.js Buffer JSON representation, or number array.
+ * Handles Uint8Array, ArrayBuffer, Node.js Buffer JSON representation, number array, or indexed object.
  */
 export function normalizeBinary(data: any): Uint8Array {
   if (!data) return new Uint8Array(0);
@@ -19,6 +19,16 @@ export function normalizeBinary(data: any): Uint8Array {
   if (Array.isArray(data)) return new Uint8Array(data);
   if (data?.type === "Buffer" && Array.isArray(data?.data)) {
     return new Uint8Array(data.data);
+  }
+  if (typeof data === "object") {
+    const keys = Object.keys(data);
+    if (keys.length > 0 && typeof (data as any)[0] === "number") {
+      const arr = new Uint8Array(keys.length);
+      for (let i = 0; i < keys.length; i++) {
+        arr[i] = (data as any)[i];
+      }
+      return arr;
+    }
   }
   return new Uint8Array(data);
 }
@@ -38,6 +48,7 @@ export class SocketIOProvider {
   private _onUpdateListener: (update: Uint8Array, origin: any) => void;
   private _onSyncStep2Listener?: (payload: any) => void;
   private _onUpdateSocketListener?: (payload: any) => void;
+  private _onErrorHandler?: (payload: any) => void;
   private _onConnectListener?: () => void;
   private _isDestroyed: boolean = false;
   private _syncedListeners: Set<(synced: boolean) => void> = new Set();
@@ -130,6 +141,19 @@ export class SocketIOProvider {
       }
     };
 
+    // Handler for authorization / transient room errors with automatic retry
+    this._onErrorHandler = (payload: { error?: string; filePath?: string }) => {
+      if (!payload || (payload.filePath && payload.filePath !== this.filePath)) return;
+      if (payload.error && payload.error.toLowerCase().includes("unauthorized")) {
+        // Room join was in flight. Retry sync after short backoff.
+        setTimeout(() => {
+          if (!this._isDestroyed && this.socket && this.socket.connected && !this.synced) {
+            this.requestSync();
+          }
+        }, 250);
+      }
+    };
+
     // Handler for reconnection / initial connection
     this._onConnectListener = () => {
       this.requestSync();
@@ -137,9 +161,10 @@ export class SocketIOProvider {
 
     socket.on("yjs_sync_step2", this._onSyncStep2Listener);
     socket.on("yjs_update", this._onUpdateSocketListener);
+    socket.on("yjs_error", this._onErrorHandler);
     socket.on("connect", this._onConnectListener);
 
-    // If already connected, initiate sync Step 1 immediately
+    // If already connected, initiate sync Step 1
     if (socket.connected) {
       this.requestSync();
     }
@@ -171,6 +196,9 @@ export class SocketIOProvider {
       }
       if (this._onUpdateSocketListener) {
         this.socket.off("yjs_update", this._onUpdateSocketListener);
+      }
+      if (this._onErrorHandler) {
+        this.socket.off("yjs_error", this._onErrorHandler);
       }
       if (this._onConnectListener) {
         this.socket.off("connect", this._onConnectListener);
@@ -206,6 +234,7 @@ export class SocketIOProvider {
 export class YjsWorkspaceManager {
   public readonly roomId: string;
   private _socket: Socket | null = null;
+  private _isRoomJoined: boolean = false;
   private _docs: Map<string, Y.Doc> = new Map();
   private _providers: Map<string, SocketIOProvider> = new Map();
   private _bindings: Map<string, MonacoBinding> = new Map();
@@ -216,11 +245,25 @@ export class YjsWorkspaceManager {
     this._socket = socket ?? null;
   }
 
+  public markRoomJoined(joined: boolean = true) {
+    this._isRoomJoined = joined;
+    if (joined && this._socket && this._socket.connected) {
+      for (const provider of this._providers.values()) {
+        if (!provider.synced) {
+          provider.requestSync();
+        }
+      }
+    }
+  }
+
   public setSocket(socket: Socket | null) {
     this._socket = socket;
     if (socket) {
       for (const provider of this._providers.values()) {
         provider.attachSocket(socket);
+        if (this._isRoomJoined && socket.connected && !provider.synced) {
+          provider.requestSync();
+        }
       }
     } else {
       for (const provider of this._providers.values()) {
@@ -230,13 +273,10 @@ export class YjsWorkspaceManager {
   }
 
   /**
-   * Get or create a shared Y.Doc and SocketIOProvider for a given file path.
-   * Ensures exactly one Y.Doc and provider instance exists per logical file identity.
+   * Explicitly create a new file with starter content (called when user creates a file).
    */
-  public getOrCreate(filePath: string, initialContent?: string): { doc: Y.Doc; provider: SocketIOProvider } {
+  public createFile(filePath: string, initialContent?: string): { doc: Y.Doc; provider: SocketIOProvider } {
     let doc = this._docs.get(filePath);
-    let provider = this._providers.get(filePath);
-
     if (!doc) {
       doc = new Y.Doc();
       if (initialContent) {
@@ -247,10 +287,34 @@ export class YjsWorkspaceManager {
       doc.getText("monaco").insert(0, initialContent);
     }
 
+    let provider = this._providers.get(filePath);
+    if (!provider) {
+      provider = new SocketIOProvider(this.roomId, filePath, doc, this._socket);
+      provider.synced = true;
+      this._providers.set(filePath, provider);
+    }
+
+    return { doc, provider };
+  }
+
+  /**
+   * Get or create a shared Y.Doc and SocketIOProvider for a given file path.
+   * Ensures exactly one Y.Doc and provider instance exists per logical file identity.
+   * Does NOT insert uncoordinated edits into existing files before server sync.
+   */
+  public getOrCreate(filePath: string, initialContent?: string): { doc: Y.Doc; provider: SocketIOProvider } {
+    let doc = this._docs.get(filePath);
+    let provider = this._providers.get(filePath);
+
+    if (!doc) {
+      doc = new Y.Doc();
+      this._docs.set(filePath, doc);
+    }
+
     if (!provider) {
       provider = new SocketIOProvider(this.roomId, filePath, doc, this._socket);
       this._providers.set(filePath, provider);
-      if (initialContent) {
+      if (this._isRoomJoined && this._socket?.connected) {
         provider.requestSync(initialContent);
       }
     }
@@ -266,7 +330,7 @@ export class YjsWorkspaceManager {
     filePath: string,
     editorInstance: editor.IStandaloneCodeEditor,
     model: editor.ITextModel,
-    initialContent?: string
+    placeholderContent?: string
   ): MonacoBinding {
     // 1. Unbind previous active binding if switching from another file
     if (this._activeBindingPath && this._activeBindingPath !== filePath) {
@@ -275,35 +339,61 @@ export class YjsWorkspaceManager {
     // Also unbind any old binding specifically for this file
     this.unbindMonaco(filePath);
 
-    const { doc } = this.getOrCreate(filePath, initialContent);
+    const { doc, provider } = this.getOrCreate(filePath, placeholderContent);
     const ytext = doc.getText("monaco");
 
-    // 2. CRITICAL PRE-SEEDING:
-    // If ytext is empty, but model has initial text or initialContent was provided,
-    // seed ytext BEFORE instantiating MonacoBinding so MonacoBinding does NOT wipe model.getValue()!
-    const modelText = model.getValue();
-    if (ytext.length === 0) {
-      const textToSeed = initialContent || modelText;
-      if (textToSeed) {
-        ytext.insert(0, textToSeed);
+    // Helper to safely mount MonacoBinding without double-initialization
+    const attachBinding = (): MonacoBinding => {
+      // Unbind any stale binding on this path
+      const old = this._bindings.get(filePath);
+      if (old) {
+        try {
+          old.destroy();
+        } catch {}
+        this._bindings.delete(filePath);
       }
-    } else {
-      // If ytext has text (e.g. from server sync) and model doesn't match, update model
+
       const ytextStr = ytext.toString();
-      if (model.getValue() !== ytextStr) {
+      if (ytextStr.length > 0 && model.getValue() !== ytextStr) {
         model.setValue(ytextStr);
       }
+
+      const binding = new MonacoBinding(
+        ytext,
+        model,
+        new Set([editorInstance]),
+        null
+      );
+      this._bindings.set(filePath, binding);
+      this._activeBindingPath = filePath;
+      return binding;
+    };
+
+    this._activeBindingPath = filePath;
+
+    if (provider.synced || ytext.length > 0) {
+      // Document already holds authoritative CRDT state; bind synchronously
+      return attachBinding();
     }
 
-    const binding = new MonacoBinding(
-      ytext,
-      model,
-      new Set([editorInstance]),
-      null
-    );
+    // While initial sync is pending, show placeholder content without modifying CRDT
+    if (placeholderContent && model.getValue() !== placeholderContent) {
+      model.setValue(placeholderContent);
+    }
 
-    this._bindings.set(filePath, binding);
-    this._activeBindingPath = filePath;
+    // Attach binding immediately; when Step 2 arrives Yjs will update model via observer
+    const binding = attachBinding();
+
+    // In case Step 2 resolves, ensure model is aligned
+    provider.onSynced(() => {
+      if (this._activeBindingPath === filePath) {
+        const syncedStr = ytext.toString();
+        if (syncedStr.length > 0 && model.getValue() !== syncedStr) {
+          model.setValue(syncedStr);
+        }
+      }
+    });
+
     return binding;
   }
 
@@ -385,3 +475,4 @@ export class YjsWorkspaceManager {
     this._docs.clear();
   }
 }
+

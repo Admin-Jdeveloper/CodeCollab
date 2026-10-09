@@ -22,6 +22,16 @@ export function normalizeBinary(data: any): Uint8Array {
   if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
   if (Array.isArray(data)) return new Uint8Array(data);
   if (data?.type === "Buffer" && Array.isArray(data?.data)) return new Uint8Array(data.data);
+  if (typeof data === "object") {
+    const keys = Object.keys(data);
+    if (keys.length > 0 && typeof (data as any)[0] === "number") {
+      const arr = new Uint8Array(keys.length);
+      for (let i = 0; i < keys.length; i++) {
+        arr[i] = (data as any)[i];
+      }
+      return arr;
+    }
+  }
   return new Uint8Array(data);
 }
 
@@ -696,13 +706,22 @@ io.on("connection", (socket: Socket) => {
       }
 
       // 1. Authorization check
-      const roomMap = roomUsers.get(roomId);
+      let roomMap = roomUsers.get(roomId);
       if (!roomMap || !roomMap.has(socket.id)) {
-        socket.emit("yjs_error", {
-          error: "Unauthorized: Must join room before syncing document",
-          filePath,
-        });
-        return;
+        if (socket.rooms.has(roomId) || socket.rooms.has(`room:${roomId}`)) {
+          if (!roomMap) {
+            roomMap = new Map();
+            roomUsers.set(roomId, roomMap);
+          }
+          const color = getColorForSocket(roomId, socket.id);
+          roomMap.set(socket.id, { socketId: socket.id, userId: socket.id, userName: "Guest", roomId, color });
+        } else {
+          socket.emit("yjs_error", {
+            error: "Unauthorized: Must join room before syncing document",
+            filePath,
+          });
+          return;
+        }
       }
 
       // 2. Ensure room files are hydrated from DB / memory
@@ -785,10 +804,19 @@ io.on("connection", (socket: Socket) => {
       }
 
       // 1. Authorization check
-      const roomMap = roomUsers.get(roomId);
+      let roomMap = roomUsers.get(roomId);
       if (!roomMap || !roomMap.has(socket.id)) {
-        socket.emit("yjs_error", { error: "Unauthorized: not in room", filePath });
-        return;
+        if (socket.rooms.has(roomId) || socket.rooms.has(`room:${roomId}`)) {
+          if (!roomMap) {
+            roomMap = new Map();
+            roomUsers.set(roomId, roomMap);
+          }
+          const color = getColorForSocket(roomId, socket.id);
+          roomMap.set(socket.id, { socketId: socket.id, userId: socket.id, userName: "Guest", roomId, color });
+        } else {
+          socket.emit("yjs_error", { error: "Unauthorized: not in room", filePath });
+          return;
+        }
       }
 
       // 2. Per-socket rate limit check
