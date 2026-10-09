@@ -726,6 +726,9 @@ io.on("connection", (socket: Socket) => {
           ydoc,
         };
         fileCache.set(filePath, state);
+      } else if (payload.initialContent && state.ydoc.getText("monaco").length === 0 && typeof payload.initialContent === "string") {
+        state.ydoc.getText("monaco").insert(0, payload.initialContent);
+        state.content = payload.initialContent;
       }
 
       // 3. Compute server diff from client vector safely
@@ -1030,41 +1033,66 @@ io.on("connection", (socket: Socket) => {
   socket.on("file_created", async ({
     roomId, filePath, name, language, content,
   }: { roomId: string; filePath: string; name: string; language: string; content: string }) => {
+    if (!roomId || !filePath) return;
     const fileCache = await ensureRoomHydrated(roomId);
-    const existing = fileCache.get(filePath);
-    const version = existing ? existing.version + 1 : 1;
+    let state = fileCache.get(filePath);
 
-    try {
-      const file = await prisma.file.upsert({
-        where: { roomId_path: { roomId, path: filePath } },
-        create: { roomId, path: filePath, name, content, language, version },
-        update: { name, content, language, version },
-      });
-
+    // 1. Synchronously initialize Y.Doc with starter content in-memory BEFORE async DB query
+    if (!state) {
       const ydoc = new Y.Doc();
       if (content) {
         ydoc.getText("monaco").insert(0, content);
       }
-
-      fileCache.set(filePath, {
-        id: file.id,
+      state = {
+        id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         path: filePath,
-        name,
-        content,
-        language,
-        version: file.version,
-        updatedAt: file.updatedAt,
+        name: name || (filePath.split("/").pop() ?? "file"),
+        content: content || "",
+        language: language || "cpp",
+        version: 1,
+        updatedAt: new Date(),
         ydoc,
-      });
+      };
+      fileCache.set(filePath, state);
+    } else {
+      const ytext = state.ydoc.getText("monaco");
+      if (ytext.length === 0 && content) {
+        ytext.insert(0, content);
+        state.content = content;
+      }
+    }
 
-      io.to(roomId).emit("file_created", {
-        fileId: file.id,
+    // 2. Broadcast file_created immediately to all peers in the room
+    io.to(roomId).emit("file_created", {
+      fileId: state.id,
+      filePath,
+      name: state.name,
+      language: state.language,
+      content: state.content,
+      version: state.version,
+    });
+
+    // 3. Broadcast initial CRDT update so all peers' Yjs providers sync the starter code instantly
+    const initialUpdate = Y.encodeStateAsUpdate(state.ydoc);
+    if (initialUpdate.length > 2) {
+      io.to(roomId).emit("yjs_update", {
+        roomId,
         filePath,
-        name,
-        language,
-        content,
-        version: file.version,
+        update: initialUpdate,
       });
+      broadcastYjsUpdate(roomId, filePath, initialUpdate);
+    }
+
+    // 4. Persist to database asynchronously without blocking client sync
+    try {
+      const file = await prisma.file.upsert({
+        where: { roomId_path: { roomId, path: filePath } },
+        create: { roomId, path: filePath, name: state.name, content: state.content, language: state.language, version: state.version },
+        update: { name: state.name, content: state.content, language: state.language, version: state.version },
+      });
+      if (file.id && state.id !== file.id) {
+        state.id = file.id;
+      }
     } catch (err: any) {
       console.error("[DB] file_created persist failed:", err.message);
     }

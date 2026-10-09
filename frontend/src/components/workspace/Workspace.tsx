@@ -79,7 +79,14 @@ const STARTER_CONTENT: Record<string, string> = {
 using namespace std;
 
 int main() {
-    cout << "🚀 CodeCollab – Real-Time Collaborative Workspace" << endl;
+    cout << "🚀 CodeCollab – Real-Time Collaborative Workspace (C++)" << endl;
+    return 0;
+}
+`,
+  c: `#include <stdio.h>
+
+int main() {
+    printf("🚀 CodeCollab – Real-Time Collaborative Workspace (C)\\n");
     return 0;
 }
 `,
@@ -92,6 +99,14 @@ function main() {
 }
 main();
 `,
+  typescript: `// 🚀 CodeCollab — TypeScript Workspace
+function main(): void {
+    console.log("CodeCollab: synchronized in real-time!");
+    const greeting: string = "Hello from TypeScript!";
+    console.log(greeting);
+}
+main();
+`,
   python: `# 🚀 CodeCollab — Python Workspace
 def main():
     print("CodeCollab: synchronized in real-time!")
@@ -100,6 +115,24 @@ def main():
 
 if __name__ == "__main__":
     main()
+`,
+  java: `public class Main {
+    public static void main(String[] args) {
+        System.out.println("🚀 CodeCollab – Java Workspace");
+    }
+}
+`,
+  rust: `fn main() {
+    println!("🚀 CodeCollab – Rust Workspace");
+}
+`,
+  go: `package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("🚀 CodeCollab – Go Workspace")
+}
 `,
 };
 
@@ -540,7 +573,8 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     },
 
     onFileCreated: ({ filePath, name, language, content }) => {
-      yjsManagerRef.current?.getOrCreate(filePath);
+      // Warm up Yjs document with starter content received from creator
+      yjsManagerRef.current?.getOrCreate(filePath, content);
       setFiles((prev) => {
         if (prev.some((f) => f.path === filePath)) return prev;
         return [...prev, { path: filePath, name, language, content }];
@@ -653,22 +687,30 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
       const yjsManager = yjsManagerRef.current;
       if (!ed || !monaco || !yjsManager) return;
 
-      const { doc } = yjsManager.getOrCreate(filePath);
+      const existingFile = filesRef.current.find((f) => f.path === filePath);
+      const defaultContent = STARTER_CONTENT[language] || `// ${filePath.replace(/^\//, "")}\n`;
+      const initialText = existingFile?.content || defaultContent;
+
+      const { doc } = yjsManager.getOrCreate(filePath, initialText);
       const uri = monaco.Uri.parse(`inmemory://workspace/${filePath.replace(/^\//, "")}`);
       let model = monaco.editor.getModel(uri);
+      const docText = doc.getText("monaco").toString();
+      const textForModel = docText || initialText;
+
       if (!model || model.isDisposed()) {
-        const existingFile = filesRef.current.find((f) => f.path === filePath);
-        const initialText = doc.getText("monaco").toString() || existingFile?.content || "";
-        model = monaco.editor.createModel(initialText, langFromMonaco(language), uri);
+        model = monaco.editor.createModel(textForModel, langFromMonaco(language), uri);
       } else {
         monaco.editor.setModelLanguage(model, langFromMonaco(language));
+        if (textForModel && model.getValue() !== textForModel) {
+          model.setValue(textForModel);
+        }
       }
 
       if (ed.getModel() !== model) {
         ed.setModel(model);
       }
 
-      yjsManager.bindMonaco(filePath, ed, model);
+      yjsManager.bindMonaco(filePath, ed, model, textForModel);
     },
     []
   );
@@ -747,7 +789,14 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
   const handleFileCreate = (name: string, language: string) => {
     const path = `/${name}`;
     const content = STARTER_CONTENT[language] ?? `// ${name}\n`;
+
+    // 1. Pre-seed local Yjs document with starter template
+    yjsManagerRef.current?.getOrCreate(path, content);
+
+    // 2. Emit file_created to server and peers
     emitFileCreated(path, name, language, content);
+
+    // 3. Update local files state
     setFiles((prev) => {
       if (prev.some((f) => f.path === path)) return prev;
       return [...prev, { path, name, language, content }];
@@ -888,7 +937,14 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     setIsTerminalOpen(true);
 
     try {
-      const codeToRun = editorRef.current ? editorRef.current.getValue() : activeFile.content;
+      const yjsText = yjsManagerRef.current?.getText(activeFile.path);
+      const editorText = editorRef.current?.getValue();
+      const codeToRun = (yjsText && yjsText.trim().length > 0)
+        ? yjsText
+        : (editorText && editorText.trim().length > 0)
+          ? editorText
+          : activeFile.content;
+
       const result = await executeCodeLocally({
         language: activeFile.language,
         code: codeToRun,

@@ -385,6 +385,93 @@ async function runYjsCollaborationTests() {
     );
 
     rogueClient.disconnect();
+
+    // 15. Multi-File: New File Creation With Template Code Preserved
+    const secondaryFile = "/solution.cpp";
+    const templateCode = `#include <iostream>
+int main() {
+    std::cout << "TEST_TEMPLATE_OUTPUT" << std::endl;
+    return 0;
+}
+`;
+    const doc1Sec = new Y.Doc();
+    const doc2Sec = new Y.Doc();
+    const text1Sec = doc1Sec.getText("monaco");
+    const text2Sec = doc2Sec.getText("monaco");
+
+    client1!.on("yjs_update", (payload: any) => {
+      if (payload.filePath === secondaryFile) {
+        Y.applyUpdate(doc1Sec, normalizeBinary(payload.update), "remote");
+      }
+    });
+
+    client2!.on("yjs_update", (payload: any) => {
+      if (payload.filePath === secondaryFile) {
+        Y.applyUpdate(doc2Sec, normalizeBinary(payload.update), "remote");
+      }
+    });
+
+    // Client 1 emits file_created with template code
+    client1!.emit("file_created", {
+      roomId: testRoom,
+      filePath: secondaryFile,
+      name: "solution.cpp",
+      language: "cpp",
+      content: templateCode,
+    });
+
+    await wait(300);
+
+    // Client 2 requests sync for the new file
+    await new Promise<void>((resolve) => {
+      client2!.once("yjs_sync_step2", (payload: any) => {
+        if (payload.filePath === secondaryFile && payload.update) {
+          Y.applyUpdate(doc2Sec, normalizeBinary(payload.update), "remote");
+        }
+        resolve();
+      });
+      client2!.emit("yjs_sync_step1", {
+        roomId: testRoom,
+        filePath: secondaryFile,
+        stateVector: Y.encodeStateVector(doc2Sec),
+        initialContent: templateCode,
+      });
+      setTimeout(resolve, 1000);
+    });
+
+    assert(
+      text2Sec.toString().includes("TEST_TEMPLATE_OUTPUT"),
+      "Multi-File: Template code is preserved and delivered to peer on file creation without blanking"
+    );
+
+    // 16. Multi-File: Simultaneous Editing in the New File
+    doc1Sec.on("update", (update: Uint8Array, origin: any) => {
+      if (origin !== "remote") {
+        client1!.emit("yjs_update", { roomId: testRoom, filePath: secondaryFile, update });
+      }
+    });
+    doc2Sec.on("update", (update: Uint8Array, origin: any) => {
+      if (origin !== "remote") {
+        client2!.emit("yjs_update", { roomId: testRoom, filePath: secondaryFile, update });
+      }
+    });
+
+    text1Sec.insert(text1Sec.length, "\n// Peer 1 edit in secondary file");
+    text2Sec.insert(text2Sec.length, "\n// Peer 2 edit in secondary file");
+    await wait(500);
+
+    assert(
+      text1Sec.toString() === text2Sec.toString() &&
+      text1Sec.toString().includes("Peer 1 edit") &&
+      text1Sec.toString().includes("Peer 2 edit"),
+      "Multi-File: Real-time synchronization active on secondary file with deterministic convergence"
+    );
+
+    // 17. Code Execution Readiness: Content is Non-Empty
+    assert(
+      text1Sec.toString().length > 50 && text1Sec.toString().includes("TEST_TEMPLATE_OUTPUT"),
+      "Execution Readiness: getText on secondary file returns full populated code for execution"
+    );
   } catch (err: any) {
     console.error("Test execution failed:", err);
     failed++;

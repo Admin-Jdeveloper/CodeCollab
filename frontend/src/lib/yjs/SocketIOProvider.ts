@@ -148,14 +148,16 @@ export class SocketIOProvider {
   /**
    * Request synchronization by sending local state vector to server (Step 1).
    */
-  public requestSync() {
+  public requestSync(initialContent?: string) {
     if (!this.socket || !this.socket.connected) return;
 
     const stateVector = Y.encodeStateVector(this.doc);
+    const content = initialContent || this.doc.getText("monaco").toString();
     this.socket.emit("yjs_sync_step1", {
       roomId: this.roomId,
       filePath: this.filePath,
       stateVector: stateVector,
+      initialContent: content || undefined,
     });
   }
 
@@ -231,18 +233,26 @@ export class YjsWorkspaceManager {
    * Get or create a shared Y.Doc and SocketIOProvider for a given file path.
    * Ensures exactly one Y.Doc and provider instance exists per logical file identity.
    */
-  public getOrCreate(filePath: string): { doc: Y.Doc; provider: SocketIOProvider } {
+  public getOrCreate(filePath: string, initialContent?: string): { doc: Y.Doc; provider: SocketIOProvider } {
     let doc = this._docs.get(filePath);
     let provider = this._providers.get(filePath);
 
     if (!doc) {
       doc = new Y.Doc();
+      if (initialContent) {
+        doc.getText("monaco").insert(0, initialContent);
+      }
       this._docs.set(filePath, doc);
+    } else if (initialContent && doc.getText("monaco").length === 0) {
+      doc.getText("monaco").insert(0, initialContent);
     }
 
     if (!provider) {
       provider = new SocketIOProvider(this.roomId, filePath, doc, this._socket);
       this._providers.set(filePath, provider);
+      if (initialContent) {
+        provider.requestSync(initialContent);
+      }
     }
 
     return { doc, provider };
@@ -255,13 +265,35 @@ export class YjsWorkspaceManager {
   public bindMonaco(
     filePath: string,
     editorInstance: editor.IStandaloneCodeEditor,
-    model: editor.ITextModel
+    model: editor.ITextModel,
+    initialContent?: string
   ): MonacoBinding {
-    // Unbind any existing binding for this file path
+    // 1. Unbind previous active binding if switching from another file
+    if (this._activeBindingPath && this._activeBindingPath !== filePath) {
+      this.unbindMonaco(this._activeBindingPath);
+    }
+    // Also unbind any old binding specifically for this file
     this.unbindMonaco(filePath);
 
-    const { doc } = this.getOrCreate(filePath);
+    const { doc } = this.getOrCreate(filePath, initialContent);
     const ytext = doc.getText("monaco");
+
+    // 2. CRITICAL PRE-SEEDING:
+    // If ytext is empty, but model has initial text or initialContent was provided,
+    // seed ytext BEFORE instantiating MonacoBinding so MonacoBinding does NOT wipe model.getValue()!
+    const modelText = model.getValue();
+    if (ytext.length === 0) {
+      const textToSeed = initialContent || modelText;
+      if (textToSeed) {
+        ytext.insert(0, textToSeed);
+      }
+    } else {
+      // If ytext has text (e.g. from server sync) and model doesn't match, update model
+      const ytextStr = ytext.toString();
+      if (model.getValue() !== ytextStr) {
+        model.setValue(ytextStr);
+      }
+    }
 
     const binding = new MonacoBinding(
       ytext,
