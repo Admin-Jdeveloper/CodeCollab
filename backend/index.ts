@@ -4,22 +4,76 @@ import bcrypt from "bcryptjs";
 import { prisma } from "./db";
 import { createRedisClient } from "./redis";
 import { ExecutionRateLimiter } from "./execution/rateLimiter";
-import { enqueueExecution, cancelExecutionJob } from "./execution/queue";
+import { enqueueExecution, cancelExecutionJob, closeExecutionQueue } from "./execution/queue";
 
 const app = express();
 
-app.use(express.json());
-app.use(cors({ origin: "*", credentials: true }));
+let isShuttingDown = false;
+
+// ── Production-hardened CORS Configuration ──────────────────
+const rawCorsOrigin = process.env.CORS_ORIGIN?.trim();
+const allowedOrigins = rawCorsOrigin && rawCorsOrigin !== "*"
+  ? rawCorsOrigin.split(",").map((o) => o.trim().replace(/\/+$/, ""))
+  : null;
+
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    // If no origin header (e.g. server-to-server, curl, Postman), allow
+    if (!origin) return callback(null, true);
+    if (!allowedOrigins) {
+      // Dynamic origin reflection allows arbitrary origins while supporting credentials
+      return callback(null, true);
+    }
+    const cleanOrigin = origin.replace(/\/+$/, "");
+    if (allowedOrigins.includes(cleanOrigin) || allowedOrigins.includes("*")) {
+      return callback(null, true);
+    }
+    return callback(null, false);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-user-id", "X-Requested-With"],
+  exposedHeaders: ["Content-Range", "X-Content-Range"],
+  maxAge: 86400,
+};
+
+app.use(cors(corsOptions));
+
+// Handle preflight requests
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") {
+    res.header("Access-Control-Max-Age", "86400");
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+
+// Handle JSON parsing errors gracefully
+app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err instanceof SyntaxError && "status" in err && err.status === 400 && "body" in err) {
+    return res.status(400).json({ error: "Malformed JSON payload", details: err.message });
+  }
+  next(err);
+});
 
 const redis = createRedisClient("api");
 const rateLimiter = new ExecutionRateLimiter(redis);
 
 // ── Health & Readiness Probes ────────────────────────────────
 app.get("/health", (_req, res) => {
+  if (isShuttingDown) {
+    return res.status(503).json({ status: "shutting_down" });
+  }
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
 app.get("/ready", async (_req, res) => {
+  if (isShuttingDown) {
+    return res.status(503).json({ status: "shutting_down" });
+  }
   try {
     await prisma.$queryRaw`SELECT 1`;
     const pong = await redis.ping();
@@ -212,8 +266,10 @@ app.delete("/api/room/:id", async (req, res) => {
       return res.status(404).json({ error: "Workspace not found" });
     }
 
-    if (room.creatorId && userId && room.creatorId !== userId) {
-      return res.status(403).json({ error: "Unauthorized to delete this workspace" });
+    if (room.creatorId) {
+      if (!userId || room.creatorId !== userId) {
+        return res.status(403).json({ error: "Unauthorized to delete this workspace" });
+      }
     }
 
     await prisma.room.delete({ where: { id: roomId } });
@@ -473,9 +529,14 @@ app.post("/api/room/:id/files", async (req, res) => {
 
 // PUT update file content (REST fallback — socket is preferred for real-time)
 app.put("/api/room/:id/files/:fileId", async (req, res) => {
-  const { fileId } = req.params;
+  const { id: roomId, fileId } = req.params;
   const { content, language, name } = req.body;
   try {
+    const existing = await prisma.file.findUnique({ where: { id: fileId } });
+    if (!existing || existing.roomId !== roomId) {
+      return res.status(404).json({ error: "File not found in this workspace" });
+    }
+
     const file = await prisma.file.update({
       where: { id: fileId },
       data: {
@@ -500,9 +561,19 @@ app.delete("/api/room/:id/files/:fileId", async (req, res) => {
       where: { id: roomId },
       select: { creatorId: true },
     });
+    if (!room) {
+      return res.status(404).json({ error: "Workspace not found" });
+    }
 
-    if (room?.creatorId && userId && room.creatorId !== userId) {
-      return res.status(403).json({ error: "Permission denied: Only the workspace owner can delete files." });
+    if (room.creatorId) {
+      if (!userId || room.creatorId !== userId) {
+        return res.status(403).json({ error: "Permission denied: Only the workspace owner can delete files." });
+      }
+    }
+
+    const file = await prisma.file.findUnique({ where: { id: fileId } });
+    if (!file || file.roomId !== roomId) {
+      return res.status(404).json({ error: "File not found in this workspace" });
     }
 
     await prisma.file.delete({ where: { id: fileId } });
@@ -619,6 +690,18 @@ app.post("/api/room/:id/rollback/:commitId", async (req, res) => {
   console.log(`[VCS] REST rollback triggered — commitId: ${commitId}, room: ${roomId}`);
 
   try {
+    const room = await prisma.room.findUnique({
+      where: { id: roomId },
+      select: { creatorId: true },
+    });
+    if (!room) {
+      return res.status(404).json({ error: "Workspace not found" });
+    }
+    const userId = (req.headers["x-user-id"] as string) || (req.body.userId as string);
+    if (room.creatorId && (!userId || room.creatorId !== userId)) {
+      return res.status(403).json({ error: "Permission denied: Only the workspace owner can perform rollbacks." });
+    }
+
     const commit = await prisma.commit.findUnique({ where: { id: commitId } });
 
     if (!commit) {
@@ -827,7 +910,64 @@ app.post("/api/execution/:id/cancel", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+// ── 404 and Global Error Handling ────────────────────────────
+app.use((_req, res) => {
+  res.status(404).json({ error: "Endpoint not found" });
 });
+
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error("[REST API] Unhandled error:", err.message || err);
+  if (res.headersSent) return;
+  const status = typeof err.status === "number" && err.status >= 400 && err.status < 600 ? err.status : 500;
+  res.status(status).json({
+    error: err.message || "Internal server error",
+    ...(process.env.NODE_ENV !== "production" && { stack: err.stack }),
+  });
+});
+
+// ── Server Startup & Lifecycle ───────────────────────────────
+const PORT = Number(process.env.PORT) || 3000;
+const server = app.listen(PORT, () => {
+  console.log(`[CodeCollab REST API] 🚀 Server running on port ${PORT} (PID: ${process.pid})`);
+});
+
+// ── Graceful Shutdown ─────────────────────────────────────────
+async function gracefulShutdown(signal: string) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`[CodeCollab REST API] Received ${signal}. Initiating graceful shutdown...`);
+
+  // Bounded timeout to prevent hanging processes
+  const forcedExitTimer = setTimeout(() => {
+    console.error("[CodeCollab REST API] Shutdown timed out (10s). Forcing termination.");
+    process.exit(1);
+  }, 10000);
+  forcedExitTimer.unref();
+
+  server.close(async () => {
+    console.log("[CodeCollab REST API] Closed HTTP listener. Draining connections...");
+    try {
+      await closeExecutionQueue();
+      await redis.quit();
+      console.log("[CodeCollab REST API] Redis & execution queue clients closed.");
+    } catch (err: any) {
+      console.warn("[CodeCollab REST API] Redis disconnect warning:", err.message);
+    }
+
+    try {
+      await prisma.$disconnect();
+      console.log("[CodeCollab REST API] Database pool disconnected.");
+    } catch (err: any) {
+      console.warn("[CodeCollab REST API] Database disconnect warning:", err.message);
+    }
+
+    clearTimeout(forcedExitTimer);
+    console.log("[CodeCollab REST API] Graceful shutdown completed cleanly.");
+    process.exit(0);
+  });
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+export { app, server };

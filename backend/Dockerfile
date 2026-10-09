@@ -13,7 +13,7 @@ RUN bun install
 COPY . .
 
 # Generate Prisma client
-RUN bunx prisma generate
+RUN bunx --bun prisma generate
 
 EXPOSE 3000 3001
 

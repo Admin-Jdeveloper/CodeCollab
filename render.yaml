@@ -1,0 +1,41 @@
+services:
+  # ── Service A: REST API Web Service ─────────────────────────
+  - type: web
+    name: codecollab-api
+    runtime: bun
+    rootDir: backend
+    plan: free
+    region: oregon
+    buildCommand: bun install && bun run db:generate
+    preDeployCommand: bun run db:migrate
+    startCommand: bun run start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: CORS_ORIGIN
+        value: "*"
+
+  # ── Service B: Socket.IO Real-Time Web Service ──────────────
+  - type: web
+    name: codecollab-socket
+    runtime: bun
+    rootDir: backend
+    plan: free
+    region: oregon
+    buildCommand: bun install && bun run db:generate
+    startCommand: bun run start:socket
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: CORS_ORIGIN
+        value: "*"

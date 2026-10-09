@@ -117,11 +117,44 @@ function getColorForSocket(roomId: string, socketId: string): string {
 // ============================================================
 
 const app = express();
-app.use(cors({ origin: "*" }));
+
+let isShuttingDown = false;
+
+// ── Production-hardened CORS Configuration ──────────────────
+const rawCorsOrigin = process.env.CORS_ORIGIN?.trim();
+const allowedOrigins = rawCorsOrigin && rawCorsOrigin !== "*"
+  ? rawCorsOrigin.split(",").map((o) => o.trim().replace(/\/+$/, ""))
+  : null;
+
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (!allowedOrigins) return callback(null, true);
+    const cleanOrigin = origin.replace(/\/+$/, "");
+    if (allowedOrigins.includes(cleanOrigin) || allowedOrigins.includes("*")) {
+      return callback(null, true);
+    }
+    return callback(null, false);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "OPTIONS"],
+};
+
+app.use(cors(corsOptions));
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") {
+    res.header("Access-Control-Max-Age", "86400");
+    return res.sendStatus(204);
+  }
+  next();
+});
 app.use(express.json());
 
 // ── Liveness probe
 app.get("/health", (_req, res) => {
+  if (isShuttingDown) {
+    return res.status(503).json({ status: "shutting_down" });
+  }
   res.json({
     status: "ok",
     activeRooms: roomFileCache.size,
@@ -132,6 +165,9 @@ app.get("/health", (_req, res) => {
 
 // ── Readiness probe
 app.get("/ready", async (_req, res) => {
+  if (isShuttingDown) {
+    return res.status(503).json({ status: "shutting_down" });
+  }
   try {
     await prisma.$queryRaw`SELECT 1`;
     res.json({ status: "ready", database: "connected" });
@@ -143,7 +179,19 @@ app.get("/ready", async (_req, res) => {
 const httpServer = createServer(app);
 
 const io = new Server(httpServer, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
+  cors: {
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (!allowedOrigins) return callback(null, true);
+      const cleanOrigin = origin.replace(/\/+$/, "");
+      if (allowedOrigins.includes(cleanOrigin) || allowedOrigins.includes("*")) {
+        return callback(null, true);
+      }
+      return callback(null, false);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "OPTIONS"],
+  },
   transports: ["websocket", "polling"],
   pingTimeout: 60000,
   pingInterval: 25000,
@@ -639,12 +687,14 @@ io.on("connection", (socket: Socket) => {
       });
 
       // If room has an authoritative owner and the requester is not the owner, reject deletion
-      if (room?.creatorId && user?.userId && room.creatorId !== user.userId) {
-        socket.emit("file_delete_failed", {
-          error: "Permission denied: Only the workspace owner can delete files.",
-          filePath,
-        });
-        return;
+      if (room?.creatorId) {
+        if (!user?.userId || room.creatorId !== user.userId) {
+          socket.emit("file_delete_failed", {
+            error: "Permission denied: Only the workspace owner can delete files.",
+            filePath,
+          });
+          return;
+        }
       }
     } catch (err: any) {
       console.error("[DB] file_deleted auth check failed:", err.message);
@@ -751,6 +801,24 @@ io.on("connection", (socket: Socket) => {
   // ----------------------------------------------------------
   socket.on("rollback", async ({ roomId, commitId, requestedBy }: RollbackPayload) => {
     try {
+      const room = await prisma.room.findUnique({
+        where: { id: roomId },
+        select: { creatorId: true },
+      });
+      if (!room) {
+        socket.emit("rollback_error", { error: "Workspace not found" });
+        return;
+      }
+      const user = roomUsers.get(roomId)?.get(socket.id);
+      if (room.creatorId) {
+        if (!user?.userId || room.creatorId !== user.userId) {
+          socket.emit("rollback_error", {
+            error: "Permission denied: Only the workspace owner can perform rollbacks.",
+          });
+          return;
+        }
+      }
+
       const commit = await prisma.commit.findUnique({ where: { id: commitId } });
       if (!commit || commit.roomId !== roomId) {
         socket.emit("rollback_error", { error: "Commit not found or mismatched room" });
@@ -914,14 +982,79 @@ async function flushToDB(roomId: string) {
 }
 
 // ============================================================
-// START & EXPORT
+// START & GRACEFUL SHUTDOWN
 // ============================================================
 
-const SOCKET_PORT = Number(process.env.SOCKET_PORT) || 3001;
+const SOCKET_PORT = Number(process.env.PORT) || Number(process.env.SOCKET_PORT) || 3001;
+
 httpServer.listen(SOCKET_PORT, () => {
-  console.log(`[CodeCollab] 🔌 Socket.io sync server running on port ${SOCKET_PORT}`);
-  console.log(`[CodeCollab] ⚡ Server-authoritative document versioning: ENABLED`);
-  console.log(`[CodeCollab] 🌐 Redis Socket.IO adapter: CONNECTED`);
+  console.log(`[CodeCollab Socket.IO] 🔌 Sync server running on port ${SOCKET_PORT} (PID: ${process.pid})`);
+  console.log(`[CodeCollab Socket.IO] ⚡ Server-authoritative document versioning: ENABLED`);
+  console.log(`[CodeCollab Socket.IO] 🌐 Redis adapter & pub/sub: CONNECTED`);
 });
+
+// ── Graceful Shutdown ─────────────────────────────────────────
+async function gracefulShutdown(signal: string) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`[CodeCollab Socket.IO] Received ${signal}. Initiating graceful shutdown...`);
+
+  // Bounded timeout to prevent hanging process
+  const forcedExitTimer = setTimeout(() => {
+    console.error("[CodeCollab Socket.IO] Shutdown timed out (10s). Forcing termination.");
+    process.exit(1);
+  }, 10000);
+  forcedExitTimer.unref();
+
+  // 1. Immediately cancel debounce timers and flush all in-memory room caches to PostgreSQL
+  console.log(`[CodeCollab Socket.IO] Flushing ${roomFileCache.size} active room caches to database...`);
+  for (const timer of dbSaveTimers.values()) {
+    clearTimeout(timer);
+  }
+  dbSaveTimers.clear();
+
+  try {
+    const flushPromises = Array.from(roomFileCache.keys()).map((roomId) => flushToDB(roomId));
+    await Promise.allSettled(flushPromises);
+    console.log("[CodeCollab Socket.IO] All room caches successfully flushed to database.");
+  } catch (err: any) {
+    console.warn("[CodeCollab Socket.IO] Cache flush warning:", err.message);
+  }
+
+  // 2. Close Socket.IO instance and HTTP server
+  io.close(() => {
+    console.log("[CodeCollab Socket.IO] Socket.IO instance closed.");
+  });
+
+  httpServer.close(async () => {
+    console.log("[CodeCollab Socket.IO] HTTP server closed.");
+
+    // 3. Close Redis clients
+    try {
+      await execEventsClient.unsubscribe();
+      await execEventsClient.quit();
+      await pubClient.quit();
+      await subClient.quit();
+      console.log("[CodeCollab Socket.IO] Redis clients disconnected.");
+    } catch (err: any) {
+      console.warn("[CodeCollab Socket.IO] Redis disconnect warning:", err.message);
+    }
+
+    // 4. Disconnect Prisma pool
+    try {
+      await prisma.$disconnect();
+      console.log("[CodeCollab Socket.IO] Database pool disconnected.");
+    } catch (err: any) {
+      console.warn("[CodeCollab Socket.IO] Database disconnect warning:", err.message);
+    }
+
+    clearTimeout(forcedExitTimer);
+    console.log("[CodeCollab Socket.IO] Graceful shutdown completed cleanly.");
+    process.exit(0);
+  });
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 export { io, httpServer, app };

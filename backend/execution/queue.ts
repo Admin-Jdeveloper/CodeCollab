@@ -6,7 +6,7 @@ import { prisma } from "../db";
 
 export const EXECUTION_QUEUE_NAME = "code-execution";
 
-export const executionQueue = new Queue<ExecutionJobData>(EXECUTION_QUEUE_NAME, {
+export const executionQueue = new Queue<ExecutionJobData, any, string>(EXECUTION_QUEUE_NAME, {
   connection: redisConnectionOptions,
   defaultJobOptions: {
     attempts: 1, // Do not auto-retry user syntax errors; worker handles retry logic
@@ -85,4 +85,11 @@ export async function cancelExecutionJob(executionId: string, roomId?: string): 
   }
 
   return true;
+}
+
+export async function closeExecutionQueue(): Promise<void> {
+  try {
+    await executionQueue.close();
+    await pubClient.quit();
+  } catch {}
 }
