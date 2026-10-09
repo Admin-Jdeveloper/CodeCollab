@@ -9,6 +9,11 @@ const WORKSPACES_BASE_DIR = path.join(os.tmpdir(), "codecollab_workspaces");
 if (!fs.existsSync(WORKSPACES_BASE_DIR)) {
   try {
     fs.mkdirSync(WORKSPACES_BASE_DIR, { recursive: true });
+    fs.chmodSync(WORKSPACES_BASE_DIR, 0o777);
+  } catch {}
+} else {
+  try {
+    fs.chmodSync(WORKSPACES_BASE_DIR, 0o777);
   } catch {}
 }
 
@@ -154,9 +159,10 @@ export class DockerSandbox {
     const startTime = Date.now();
     const normLang = (language || "").toLowerCase().trim();
 
-    // 1. Create isolated temporary workspace directory
+    // 1. Create isolated temporary workspace directory with full write access for sandbox user
     try {
       fs.mkdirSync(this.workspaceDir, { recursive: true });
+      try { fs.chmodSync(this.workspaceDir, 0o777); } catch {}
     } catch (e: any) {
       return {
         status: "FAILED",
@@ -210,9 +216,12 @@ export class DockerSandbox {
       // 3. Write source and stdin files to workspace
       const sourceFilePath = path.join(this.workspaceDir, sourceFileName);
       fs.writeFileSync(sourceFilePath, sourceCode, "utf8");
+      try { fs.chmodSync(sourceFilePath, 0o666); } catch {}
 
       if (stdin) {
-        fs.writeFileSync(path.join(this.workspaceDir, "input.txt"), stdin, "utf8");
+        const inputPath = path.join(this.workspaceDir, "input.txt");
+        fs.writeFileSync(inputPath, stdin, "utf8");
+        try { fs.chmodSync(inputPath, 0o666); } catch {}
       }
 
       // Base Docker arguments enforcing strict isolation
