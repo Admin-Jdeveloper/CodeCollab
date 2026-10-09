@@ -23,12 +23,14 @@
     "test:auth": "bun run tests/auth-reconnection.test.ts",
     "test:rapid": "bun run tests/rapid-typing.test.ts",
     "test:persistence": "bun run tests/out-of-order-persistence.test.ts",
-    "test": "bun run test:auth && bun run test:rapid && bun run test:persistence && bun run test:collaboration && bun run test:multi-socket",
+    "test:yjs": "bun run tests/yjs-collaboration.test.ts",
+    "test": "bun run test:auth && bun run test:rapid && bun run test:persistence && bun run test:yjs",
     "typecheck": "cd backend && bun run typecheck && cd ../frontend && bun run typecheck",
     "lint": "cd frontend && bun run lint",
     "build": "cd frontend && bun run build"
   },
   "devDependencies": {
-    "socket.io-client": "^4.8.4"
+    "socket.io-client": "^4.8.4",
+    "yjs": "^13.6.33"
   }
 }

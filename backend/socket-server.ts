@@ -3,9 +3,27 @@ import { createServer } from "node:http";
 import { Server, type Socket } from "socket.io";
 import cors from "cors";
 import { createAdapter } from "@socket.io/redis-adapter";
+import * as Y from "yjs";
 import { prisma } from "./db";
 import { createRedisClient } from "./redis";
 import { ExecutionRateLimiter } from "./execution/rateLimiter";
+
+/**
+ * Normalizes binary data from Socket.IO, Buffer, ArrayBuffer, or Array into Uint8Array.
+ */
+export function normalizeBinary(data: any): Uint8Array {
+  if (!data) return new Uint8Array(0);
+  if (data instanceof Uint8Array && data.byteOffset === 0 && data.byteLength === data.buffer.byteLength) {
+    return data;
+  }
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+  }
+  if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
+  if (Array.isArray(data)) return new Uint8Array(data);
+  if (data?.type === "Buffer" && Array.isArray(data?.data)) return new Uint8Array(data.data);
+  return new Uint8Array(data);
+}
 
 // ============================================================
 // TYPES
@@ -20,6 +38,7 @@ export interface FileState {
   version: number;
   updatedAt: Date;
   updatedBy?: string;
+  ydoc: Y.Doc;
 }
 
 /** Per-room cache: filePath → FileState */
@@ -100,6 +119,63 @@ const roomFileCache = new Map<string, RoomFileCache>();
 const roomUsers = new Map<string, Map<string, UserMeta>>();
 const dbSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+// ── Idle Room Eviction & Memory Protection ───────────────────
+const IDLE_ROOM_TTL_MS = Number(process.env.IDLE_ROOM_TTL_MS) || 10 * 60 * 1000;
+const idleRoomEvictionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleIdleRoomEviction(roomId: string) {
+  const existing = idleRoomEvictionTimers.get(roomId);
+  if (existing) clearTimeout(existing);
+
+  const timer = setTimeout(async () => {
+    idleRoomEvictionTimers.delete(roomId);
+    const users = roomUsers.get(roomId);
+    if (!users || users.size === 0) {
+      try {
+        await flushToDB(roomId);
+        const cachedFiles = roomFileCache.get(roomId);
+        if (cachedFiles) {
+          for (const state of cachedFiles.values()) {
+            state.ydoc?.destroy();
+          }
+          roomFileCache.delete(roomId);
+        }
+        console.log(`[Socket.IO] Evicted idle room ${roomId} and destroyed associated Y.Docs from memory`);
+      } catch (err: any) {
+        console.warn(`[Socket.IO] Idle room eviction error for ${roomId}:`, err.message);
+      }
+    }
+  }, IDLE_ROOM_TTL_MS);
+
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+  idleRoomEvictionTimers.set(roomId, timer);
+}
+
+function cancelIdleRoomEviction(roomId: string) {
+  const existing = idleRoomEvictionTimers.get(roomId);
+  if (existing) {
+    clearTimeout(existing);
+    idleRoomEvictionTimers.delete(roomId);
+  }
+}
+
+// ── Per-Socket Yjs Rate Limiter ──────────────────────────────
+const socketYjsRateLimits = new Map<string, { count: number; resetAt: number }>();
+const MAX_YJS_UPDATES_PER_SEC = 120;
+
+function checkYjsRateLimit(socketId: string): boolean {
+  const now = Date.now();
+  let entry = socketYjsRateLimits.get(socketId);
+  if (!entry || now > entry.resetAt) {
+    socketYjsRateLimits.set(socketId, { count: 1, resetAt: now + 1000 });
+    return true;
+  }
+  entry.count += 1;
+  return entry.count <= MAX_YJS_UPDATES_PER_SEC;
+}
+
 const USER_COLORS = [
   "#6366f1", "#8b5cf6", "#ec4899", "#f59e0b",
   "#10b981", "#06b6d4", "#f97316", "#84cc16",
@@ -111,6 +187,7 @@ function getColorForSocket(roomId: string, socketId: string): string {
   const idx = Array.from(room.keys()).indexOf(socketId);
   return USER_COLORS[Math.abs(idx) % USER_COLORS.length]!;
 }
+
 
 // ============================================================
 // EXPRESS + HTTP SERVER + SOCKET.IO SETUP
@@ -284,6 +361,7 @@ docSyncSub.on("message", (channel, message) => {
           cache.set(payload.filePath, {
             ...payload.state,
             updatedAt: new Date(payload.state.updatedAt),
+            ydoc: local?.ydoc || new Y.Doc(),
           });
         }
       }
@@ -300,7 +378,61 @@ function broadcastDocSync(roomId: string, filePath: string, state: FileState) {
       JSON.stringify({
         roomId,
         filePath,
-        state,
+        state: {
+          id: state.id,
+          path: state.path,
+          name: state.name,
+          content: state.content,
+          language: state.language,
+          version: state.version,
+          updatedAt: state.updatedAt.toISOString(),
+          updatedBy: state.updatedBy,
+        },
+        instanceId: process.pid,
+      })
+    )
+    .catch(() => {});
+}
+
+// ── Cross-instance Yjs binary update distribution via Redis ──
+const yjsSyncSub = createRedisClient("yjs-sync-sub");
+yjsSyncSub.subscribe("yjs-sync", (err) => {
+  if (err) {
+    console.warn("[Socket.IO] Failed to subscribe to yjs-sync channel:", err.message);
+  } else {
+    console.log("[Socket.IO] Subscribed to yjs-sync Redis channel");
+  }
+});
+
+yjsSyncSub.on("message", (channel, message) => {
+  if (channel === "yjs-sync") {
+    try {
+      const { roomId, filePath, update, instanceId } = JSON.parse(message);
+      if (instanceId === process.pid) return; // Skip own broadcast
+      const cache = roomFileCache.get(roomId);
+      if (cache) {
+        const state = cache.get(filePath);
+        if (state?.ydoc) {
+          const bin = normalizeBinary(update);
+          Y.applyUpdate(state.ydoc, bin, "redis");
+          state.content = state.ydoc.getText("monaco").toString();
+          state.version += 1;
+        }
+      }
+    } catch (err: any) {
+      console.warn("[Socket.IO] yjs-sync error:", err.message);
+    }
+  }
+});
+
+function broadcastYjsUpdate(roomId: string, filePath: string, update: Uint8Array) {
+  pubClient
+    .publish(
+      "yjs-sync",
+      JSON.stringify({
+        roomId,
+        filePath,
+        update: Array.from(update),
         instanceId: process.pid,
       })
     )
@@ -343,6 +475,10 @@ async function ensureRoomHydrated(roomId: string): Promise<RoomFileCache> {
       if (room) {
         if (room.files.length > 0) {
           for (const f of room.files) {
+            const ydoc = new Y.Doc();
+            if (f.content) {
+              ydoc.getText("monaco").insert(0, f.content);
+            }
             fileCache.set(f.path, {
               id: f.id,
               path: f.path,
@@ -351,6 +487,7 @@ async function ensureRoomHydrated(roomId: string): Promise<RoomFileCache> {
               language: f.language,
               version: f.version || 1,
               updatedAt: f.updatedAt,
+              ydoc,
             });
           }
         } else {
@@ -366,6 +503,10 @@ async function ensureRoomHydrated(roomId: string): Promise<RoomFileCache> {
               version: 1,
             },
           });
+          const ydoc = new Y.Doc();
+          if (initialFile.content) {
+            ydoc.getText("monaco").insert(0, initialFile.content);
+          }
           fileCache.set(defaultPath, {
             id: initialFile.id,
             path: initialFile.path,
@@ -374,6 +515,7 @@ async function ensureRoomHydrated(roomId: string): Promise<RoomFileCache> {
             language: initialFile.language,
             version: initialFile.version,
             updatedAt: initialFile.updatedAt,
+            ydoc,
           });
         }
       }
@@ -406,6 +548,7 @@ io.on("connection", (socket: Socket) => {
     lastKnownVersions?: Record<string, number>;
   }) => {
     if (!roomId) return;
+    cancelIdleRoomEviction(roomId);
     const rateCheck = await socketRateLimiter.checkJoinRoom(userId || socket.id);
     if (!rateCheck.allowed) {
       socket.emit("rate_limit_exceeded", { error: rateCheck.reason });
@@ -466,6 +609,7 @@ io.on("connection", (socket: Socket) => {
       if (users.size === 0) {
         roomUsers.delete(roomId);
         flushToDB(roomId);
+        scheduleIdleRoomEviction(roomId);
       }
     }
   });
@@ -532,6 +676,184 @@ io.on("connection", (socket: Socket) => {
   });
 
   // ----------------------------------------------------------
+  // YJS COLLABORATION PROTOCOL: STEP 1 (Initial Sync / Reconnect)
+  // Payload: { roomId, filePath, stateVector, initialContent? }
+  // ----------------------------------------------------------
+  socket.on("yjs_sync_step1", async (payload: {
+    roomId: string;
+    filePath: string;
+    stateVector: any;
+    initialContent?: string;
+  }) => {
+    try {
+      const { roomId, filePath } = payload;
+      if (!roomId || !filePath) return;
+
+      // Sanitization: reject directory traversal & null bytes
+      if (typeof filePath !== "string" || filePath.includes("..") || filePath.includes("\0")) {
+        socket.emit("yjs_error", { error: "Invalid file path", filePath });
+        return;
+      }
+
+      // 1. Authorization check
+      const roomMap = roomUsers.get(roomId);
+      if (!roomMap || !roomMap.has(socket.id)) {
+        socket.emit("yjs_error", {
+          error: "Unauthorized: Must join room before syncing document",
+          filePath,
+        });
+        return;
+      }
+
+      // 2. Ensure room files are hydrated from DB / memory
+      const fileCache = await ensureRoomHydrated(roomId);
+      let state = fileCache.get(filePath);
+
+      if (!state) {
+        const fileName = filePath.split("/").pop() ?? filePath;
+        const ydoc = new Y.Doc();
+        if (payload.initialContent && typeof payload.initialContent === "string" && payload.initialContent.length <= 1024 * 1024) {
+          ydoc.getText("monaco").insert(0, payload.initialContent);
+        }
+        state = {
+          id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          path: filePath,
+          name: fileName,
+          content: ydoc.getText("monaco").toString(),
+          language: "cpp",
+          version: 1,
+          updatedAt: new Date(),
+          ydoc,
+        };
+        fileCache.set(filePath, state);
+      }
+
+      // 3. Compute server diff from client vector safely
+      let clientVector: Uint8Array;
+      try {
+        clientVector = normalizeBinary(payload.stateVector);
+      } catch (normErr: any) {
+        console.warn(`[Yjs Security] Invalid stateVector format from socket ${socket.id}: ${normErr.message}`);
+        socket.emit("yjs_error", { error: "Invalid state vector encoding", filePath });
+        return;
+      }
+
+      let serverDiff: Uint8Array;
+      let serverVector: Uint8Array;
+      try {
+        serverDiff = Y.encodeStateAsUpdate(state.ydoc, clientVector);
+        serverVector = Y.encodeStateVector(state.ydoc);
+      } catch (encodeErr: any) {
+        console.warn(`[Yjs Security] Failed to encode diff for client vector: ${encodeErr.message}`);
+        serverDiff = Y.encodeStateAsUpdate(state.ydoc);
+        serverVector = Y.encodeStateVector(state.ydoc);
+      }
+
+      // 4. Send Step 2 update back to requesting client
+      socket.emit("yjs_sync_step2", {
+        roomId,
+        filePath,
+        update: serverDiff,
+        serverStateVector: serverVector,
+      });
+    } catch (err: any) {
+      console.error(`[Yjs] Error in yjs_sync_step1 for ${payload?.filePath}:`, err.message);
+    }
+  });
+
+  // ----------------------------------------------------------
+  // YJS COLLABORATION PROTOCOL: INCREMENTAL UPDATE
+  // Payload: { roomId, filePath, update }
+  // Transmits incremental CRDT updates conflict-free
+  // ----------------------------------------------------------
+  socket.on("yjs_update", async (payload: {
+    roomId: string;
+    filePath: string;
+    update: any;
+  }) => {
+    try {
+      const { roomId, filePath } = payload;
+      if (!roomId || !filePath || !payload.update) return;
+
+      // Sanitization: reject directory traversal & null bytes
+      if (typeof filePath !== "string" || filePath.includes("..") || filePath.includes("\0")) {
+        socket.emit("yjs_error", { error: "Invalid file path", filePath });
+        return;
+      }
+
+      // 1. Authorization check
+      const roomMap = roomUsers.get(roomId);
+      if (!roomMap || !roomMap.has(socket.id)) {
+        socket.emit("yjs_error", { error: "Unauthorized: not in room", filePath });
+        return;
+      }
+
+      // 2. Per-socket rate limit check
+      if (!checkYjsRateLimit(socket.id)) {
+        socket.emit("yjs_rate_limited", {
+          error: "Yjs update rate limit exceeded (max 120 updates/second)",
+          filePath,
+        });
+        return;
+      }
+
+      let binUpdate: Uint8Array;
+      try {
+        binUpdate = normalizeBinary(payload.update);
+      } catch (normErr: any) {
+        console.warn(`[Yjs Security] Corrupted binary payload from socket ${socket.id}: ${normErr.message}`);
+        socket.emit("yjs_error", { error: "Invalid binary update format", filePath });
+        return;
+      }
+
+      // Size validation (min 1 byte, max 1MB)
+      if (binUpdate.length === 0 || binUpdate.length > 1024 * 1024) {
+        console.warn(`[Yjs] Rejected invalid update size (${binUpdate.length} bytes) for ${filePath}`);
+        socket.emit("yjs_error", { error: "Update payload exceeds size limit (max 1MB)", filePath });
+        return;
+      }
+
+      const fileCache = await ensureRoomHydrated(roomId);
+      let state = fileCache.get(filePath);
+      if (!state) {
+        socket.emit("yjs_error", { error: "File not found", filePath });
+        return;
+      }
+
+      // 3. Apply binary update to server Y.Doc with corruption catch
+      try {
+        Y.applyUpdate(state.ydoc, binUpdate, "network");
+      } catch (crdtErr: any) {
+        console.warn(`[Yjs Security] Corrupted CRDT update received from socket ${socket.id} for ${filePath}: ${crdtErr.message}`);
+        socket.emit("yjs_error", { error: "Corrupted CRDT update payload", filePath });
+        return;
+      }
+
+      // 4. Update cached plain-text snapshot & version
+      state.content = state.ydoc.getText("monaco").toString();
+      state.version += 1;
+      state.updatedAt = new Date();
+      const user = roomMap.get(socket.id);
+      if (user?.userId) state.updatedBy = user.userId;
+
+      // 5. Broadcast incremental update to peers in room
+      socket.to(roomId).emit("yjs_update", {
+        roomId,
+        filePath,
+        update: binUpdate,
+      });
+
+      // 6. Schedule debounced DB persistence
+      schedulePersist(roomId);
+
+      // 7. Cross-instance Redis sync
+      broadcastYjsUpdate(roomId, filePath, binUpdate);
+    } catch (err: any) {
+      console.error(`[Yjs] Error handling yjs_update for ${payload?.filePath}:`, err.message);
+    }
+  });
+
+  // ----------------------------------------------------------
   // DOCUMENT VERSIONING: CODE CHANGE SYNC
   // Payload: { roomId, fileId?, filePath, version, content?, code?, senderId, language? }
   // Server is Authoritative:
@@ -550,6 +872,8 @@ io.on("connection", (socket: Socket) => {
     if (!state) {
       // Create new file state if missing
       const fileName = filePath.split("/").pop() ?? filePath;
+      const ydoc = new Y.Doc();
+      if (newContent) ydoc.getText("monaco").insert(0, newContent);
       state = {
         id: payload.fileId || `file-${Date.now()}`,
         path: filePath,
@@ -559,6 +883,7 @@ io.on("connection", (socket: Socket) => {
         version: 1,
         updatedAt: new Date(),
         updatedBy: senderId,
+        ydoc,
       };
       fileCache.set(filePath, state);
     }
@@ -574,6 +899,15 @@ io.on("connection", (socket: Socket) => {
     if (clientVersion === state.version || isSameAuthor) {
       state.version += 1;
       state.content = newContent;
+      if (state.ydoc) {
+        const ytext = state.ydoc.getText("monaco");
+        if (ytext.toString() !== newContent) {
+          state.ydoc.transact(() => {
+            ytext.delete(0, ytext.length);
+            ytext.insert(0, newContent);
+          }, "legacy");
+        }
+      }
       if (language) state.language = language;
       state.updatedAt = new Date();
       state.updatedBy = senderId;
@@ -707,6 +1041,11 @@ io.on("connection", (socket: Socket) => {
         update: { name, content, language, version },
       });
 
+      const ydoc = new Y.Doc();
+      if (content) {
+        ydoc.getText("monaco").insert(0, content);
+      }
+
       fileCache.set(filePath, {
         id: file.id,
         path: filePath,
@@ -715,6 +1054,7 @@ io.on("connection", (socket: Socket) => {
         language,
         version: file.version,
         updatedAt: file.updatedAt,
+        ydoc,
       });
 
       io.to(roomId).emit("file_created", {
@@ -757,6 +1097,10 @@ io.on("connection", (socket: Socket) => {
       console.error("[DB] file_deleted auth check failed:", err.message);
     }
 
+    const cachedState = roomFileCache.get(roomId)?.get(filePath);
+    if (cachedState?.ydoc) {
+      cachedState.ydoc.destroy();
+    }
     roomFileCache.get(roomId)?.delete(filePath);
 
     try {
@@ -817,7 +1161,7 @@ io.on("connection", (socket: Socket) => {
           path: state.path,
           name: state.name,
           language: state.language,
-          content: state.content,
+          content: state.ydoc ? state.ydoc.getText("monaco").toString() : state.content,
         }));
       }
     }
@@ -898,6 +1242,11 @@ io.on("connection", (socket: Socket) => {
             update: { content: f.content, language: f.language, version: nextVersion },
           });
 
+          const ydoc = new Y.Doc();
+          if (f.content) {
+            ydoc.getText("monaco").insert(0, f.content);
+          }
+
           newFileCache.set(f.path, {
             id: updated.id,
             path: f.path,
@@ -906,7 +1255,17 @@ io.on("connection", (socket: Socket) => {
             language: f.language,
             version: nextVersion,
             updatedAt: new Date(),
+            ydoc,
           });
+
+          // Broadcast authoritative Yjs update so all Monaco bindings converge
+          const rollbackUpdate = Y.encodeStateAsUpdate(ydoc);
+          io.to(roomId).emit("yjs_update", {
+            roomId,
+            filePath: f.path,
+            update: rollbackUpdate,
+          });
+          broadcastYjsUpdate(roomId, f.path, rollbackUpdate);
         }
 
         roomFileCache.set(roomId, newFileCache);
@@ -968,9 +1327,11 @@ io.on("connection", (socket: Socket) => {
         if (users.size === 0) {
           roomUsers.delete(roomId);
           flushToDB(roomId);
+          scheduleIdleRoomEviction(roomId);
         }
       }
     }
+    socketYjsRateLimits.delete(socket.id);
   });
 });
 
@@ -1008,6 +1369,9 @@ async function flushToDB(roomId: string) {
 
   try {
     for (const state of fileCache.values()) {
+      if (state.ydoc) {
+        state.content = state.ydoc.getText("monaco").toString();
+      }
       // Version-conditional atomic write: only overwrite DB if state.version >= existing DB version
       const updated = await prisma.file.updateMany({
         where: {
@@ -1092,12 +1456,17 @@ async function gracefulShutdown(signal: string) {
   }, 10000);
   forcedExitTimer.unref();
 
-  // 1. Immediately cancel debounce timers and flush all in-memory room caches to PostgreSQL
+  // 1. Immediately cancel debounce timers, eviction timers, and flush all in-memory room caches to PostgreSQL
   console.log(`[CodeCollab Socket.IO] Flushing ${roomFileCache.size} active room caches to database...`);
   for (const timer of dbSaveTimers.values()) {
     clearTimeout(timer);
   }
   dbSaveTimers.clear();
+
+  for (const timer of idleRoomEvictionTimers.values()) {
+    clearTimeout(timer);
+  }
+  idleRoomEvictionTimers.clear();
 
   try {
     const flushPromises = Array.from(roomFileCache.keys()).map((roomId) => flushToDB(roomId));

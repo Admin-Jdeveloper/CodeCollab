@@ -35,6 +35,7 @@ import {
   type CommitSnapshot,
   type FileSnapshot,
 } from "@/hooks/useRoomSocket";
+import { YjsWorkspaceManager } from "@/lib/yjs/SocketIOProvider";
 import { VCSPanel } from "@/components/workspace/VCSPanel";
 import { FileExplorer, type WorkspaceFile } from "@/components/workspace/FileExplorer";
 import { exportWorkspaceFiles } from "@/lib/exportUtils";
@@ -161,6 +162,14 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
   const [roomOwnerId, setRoomOwnerId] = useState<string | null>(null);
   const [isCopied, setIsCopied] = useState(false);
   const isOwner = !roomOwnerId || roomOwnerId === currentUserId;
+
+  // ── Authoritative Yjs CRDT Manager for conflict-free multi-file collaboration ─
+  const yjsManagerRef = useRef<YjsWorkspaceManager | null>(null);
+  if (!yjsManagerRef.current) {
+    yjsManagerRef.current = new YjsWorkspaceManager(roomId);
+  }
+  const filesRef = useRef<WorkspaceFile[]>([]);
+  filesRef.current = files;
 
   // ── Remote-update guard (stealth mode — prevents echo loops) ──────────────
   const isRemoteUpdateRef = useRef(false);
@@ -326,8 +335,14 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     emitFileCreated,
     emitFileDeleted,
     emitFileRenamed,
+    getSocket,
   } = useRoomSocket(roomId, currentUserId, currentUserName, {
     onRoomState: ({ files: remoteFiles }) => {
+      // Warm up Yjs document and provider instances for all workspace files
+      for (const f of remoteFiles) {
+        yjsManagerRef.current?.getOrCreate(f.path);
+      }
+
       const isActivelyEditing = Date.now() - lastLocalEditTimeRef.current < 3000;
       const localCode = editorRef.current?.getModel()?.getValue();
 
@@ -359,10 +374,19 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
 
     onCodeUpdate: (filePath, remoteCode, senderId) => {
       if (senderId === currentUserId) return;
+      // When Yjs is active for this file, skip legacy full-string replace
+      const yjsManager = yjsManagerRef.current;
+      if (yjsManager && yjsManager.getText(filePath)) {
+        return;
+      }
       updateFileContent(filePath, remoteCode);
     },
 
     onSyncRequired: ({ filePath, content }) => {
+      const yjsManager = yjsManagerRef.current;
+      if (yjsManager && yjsManager.getText(filePath)) {
+        return; // Reconciled deterministically by Yjs CRDT
+      }
       const isCurrentlyActive = filePath === activeFilePathRef.current;
       const isActivelyTyping = isCurrentlyActive && (Date.now() - lastLocalEditTimeRef.current < 2500);
 
@@ -478,12 +502,33 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
         }));
         setFiles(wsFiles);
 
+        // Transactionally update Yjs documents so all connected peers converge
+        for (const snap of filesSnapshot) {
+          const doc = yjsManagerRef.current?.getOrCreate(snap.path).doc;
+          if (doc) {
+            const ytext = doc.getText("monaco");
+            if (ytext.toString() !== snap.content) {
+              doc.transact(() => {
+                ytext.delete(0, ytext.length);
+                ytext.insert(0, snap.content);
+              });
+            }
+          }
+        }
+
         const currentActive = activeFilePath ?? filesSnapshot[0]!.path;
         const activeSnap = filesSnapshot.find((f) => f.path === currentActive) ?? filesSnapshot[0]!;
         setActiveFilePath(activeSnap.path);
-        applyRemoteCode(activeSnap.content);
       } else {
         if (activeFilePath) {
+          const doc = yjsManagerRef.current?.getOrCreate(activeFilePath).doc;
+          if (doc) {
+            const ytext = doc.getText("monaco");
+            doc.transact(() => {
+              ytext.delete(0, ytext.length);
+              ytext.insert(0, legacyCode);
+            });
+          }
           updateFileContent(activeFilePath, legacyCode);
         }
       }
@@ -495,6 +540,7 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     },
 
     onFileCreated: ({ filePath, name, language, content }) => {
+      yjsManagerRef.current?.getOrCreate(filePath);
       setFiles((prev) => {
         if (prev.some((f) => f.path === filePath)) return prev;
         return [...prev, { path: filePath, name, language, content }];
@@ -510,6 +556,7 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     },
 
     onFileDeleted: ({ filePath }) => {
+      yjsManagerRef.current?.removeFile(filePath);
       setFiles((prev) => prev.filter((f) => f.path !== filePath));
       setOpenFilePaths((prev) => prev.filter((p) => p !== filePath));
       setActiveFilePath((curr) => {
@@ -586,6 +633,46 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // ── Attach/sync socket with Yjs workspace manager ────────────────────────
+  useEffect(() => {
+    const sock = getSocket();
+    yjsManagerRef.current?.setSocket(sock);
+  }, [getSocket, connectionStatus]);
+
+  useEffect(() => {
+    return () => {
+      yjsManagerRef.current?.destroy();
+    };
+  }, []);
+
+  // ── Attach Monaco model to active file's Yjs document ─────────────────────
+  const attachActiveFileModel = useCallback(
+    (filePath: string, language: string) => {
+      const ed = editorRef.current;
+      const monaco = monacoRef.current;
+      const yjsManager = yjsManagerRef.current;
+      if (!ed || !monaco || !yjsManager) return;
+
+      const { doc } = yjsManager.getOrCreate(filePath);
+      const uri = monaco.Uri.parse(`inmemory://workspace/${filePath.replace(/^\//, "")}`);
+      let model = monaco.editor.getModel(uri);
+      if (!model || model.isDisposed()) {
+        const existingFile = filesRef.current.find((f) => f.path === filePath);
+        const initialText = doc.getText("monaco").toString() || existingFile?.content || "";
+        model = monaco.editor.createModel(initialText, langFromMonaco(language), uri);
+      } else {
+        monaco.editor.setModelLanguage(model, langFromMonaco(language));
+      }
+
+      if (ed.getModel() !== model) {
+        ed.setModel(model);
+      }
+
+      yjsManager.bindMonaco(filePath, ed, model);
+    },
+    []
+  );
+
   // ── Monaco mount handler ──────────────────────────────────────────────────
   const handleEditorMount = useCallback(
     (ed: editor.IStandaloneCodeEditor, monaco: typeof import("monaco-editor")) => {
@@ -600,43 +687,41 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
           });
         }
       });
-    },
-    [activeFilePath, emitCursor]
-  );
 
-  // ── Monaco onChange handler ───────────────────────────────────────────────
-  const handleCodeChange = useCallback(
-    (value: string | undefined) => {
-      const newCode = value ?? "";
-
-      if (monacoRef.current && editorRef.current) {
-        const model = editorRef.current.getModel();
-        if (model) monacoRef.current.editor.setModelMarkers(model, "diagnostics", []);
-      }
-
-      if (isRemoteUpdateRef.current) return;
-
-      lastLocalEditTimeRef.current = Date.now();
+      ed.onDidChangeCursorSelection((e) => {
+        if (activeFilePath && e.selection) {
+          emitCursor(
+            activeFilePath,
+            {
+              lineNumber: e.selection.positionLineNumber,
+              column: e.selection.positionColumn,
+            },
+            {
+              startLineNumber: e.selection.startLineNumber,
+              startColumn: e.selection.startColumn,
+              endLineNumber: e.selection.endLineNumber,
+              endColumn: e.selection.endColumn,
+            }
+          );
+        }
+      });
 
       if (activeFilePath) {
-        setFiles((prev) =>
-          prev.map((f) => (f.path === activeFilePath ? { ...f, content: newCode } : f))
-        );
+        const currentFile = filesRef.current.find((f) => f.path === activeFilePath);
+        const language = currentFile?.language || "cpp";
+        attachActiveFileModel(activeFilePath, language);
       }
-
-      if (codeDebounceRef.current) clearTimeout(codeDebounceRef.current);
-      codeDebounceRef.current = setTimeout(() => {
-        const targetPath = activeFilePathRef.current;
-        if (!targetPath) return;
-        const currentModel = editorRef.current?.getModel();
-        const codeToEmit = (targetPath === activeFilePath && currentModel)
-          ? currentModel.getValue()
-          : newCode;
-        emitCodeChange(targetPath, codeToEmit, activeLanguage);
-      }, 30);
     },
-    [activeFilePath, activeLanguage, emitCodeChange]
+    [activeFilePath, emitCursor, attachActiveFileModel]
   );
+
+  // Synchronize active model on activeFilePath change
+  useEffect(() => {
+    if (!activeFilePath || !editorRef.current || !monacoRef.current) return;
+    const currentFile = filesRef.current.find((f) => f.path === activeFilePath);
+    const language = currentFile?.language || "cpp";
+    attachActiveFileModel(activeFilePath, language);
+  }, [activeFilePath, attachActiveFileModel]);
 
   // ── File Explorer handlers ────────────────────────────────────────────────
   const handleFileSelect = (file: WorkspaceFile) => {
@@ -734,7 +819,7 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
         path: f.path,
         name: f.name,
         language: f.language,
-        content: f.content,
+        content: yjsManagerRef.current?.getText(f.path) || f.content,
       }));
       emitCommitSnapshot(msg, snapshot, currentUserName);
       lastCommitToastRef.current = { time: Date.now(), id: "", msg };
@@ -762,8 +847,12 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     }
     setIsExporting(true);
     try {
+      const filesWithCurrentContent = files.map((f) => ({
+        ...f,
+        content: yjsManagerRef.current?.getText(f.path) || f.content,
+      }));
       const res = await exportWorkspaceFiles({
-        files,
+        files: filesWithCurrentContent,
         roomTitle,
         roomId,
       });
@@ -1159,7 +1248,7 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
                   path: f.path,
                   name: f.name,
                   language: f.language,
-                  content: f.content,
+                  content: yjsManagerRef.current?.getText(f.path) || f.content,
                 }))}
                 currentCode={activeCode}
                 currentLanguage={activeLanguage}
@@ -1238,9 +1327,6 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
               <Editor
                 height="100%"
                 theme={monacoTheme}
-                language={langFromMonaco(activeFile.language)}
-                value={activeFile.content}
-                onChange={handleCodeChange}
                 onMount={handleEditorMount}
                 options={{
                   fontSize: editorFontSize,
