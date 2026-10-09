@@ -201,6 +201,7 @@ const io = new Server(httpServer, {
 const pubClient = createRedisClient("socket-pub");
 const subClient = createRedisClient("socket-sub");
 const execEventsClient = createRedisClient("exec-events-sub");
+const docSyncSub = createRedisClient("doc-sync-sub");
 const socketRateLimiter = new ExecutionRateLimiter(pubClient);
 
 // Connection Rate Limiter Middleware
@@ -261,6 +262,50 @@ execEventsClient.on("message", (channel, message) => {
     }
   }
 });
+
+// ── Cross-instance document state synchronization via Redis ─
+docSyncSub.subscribe("doc-sync", (err) => {
+  if (err) {
+    console.warn("[Socket.IO] Failed to subscribe to doc-sync channel:", err.message);
+  } else {
+    console.log("[Socket.IO] Subscribed to doc-sync Redis channel");
+  }
+});
+
+docSyncSub.on("message", (channel, message) => {
+  if (channel === "doc-sync") {
+    try {
+      const payload = JSON.parse(message);
+      if (payload.instanceId === process.pid) return; // Skip own broadcast
+      const cache = roomFileCache.get(payload.roomId);
+      if (cache) {
+        const local = cache.get(payload.filePath);
+        if (!local || payload.state.version >= local.version) {
+          cache.set(payload.filePath, {
+            ...payload.state,
+            updatedAt: new Date(payload.state.updatedAt),
+          });
+        }
+      }
+    } catch (err: any) {
+      console.warn("[Socket.IO] doc-sync sync error:", err.message);
+    }
+  }
+});
+
+function broadcastDocSync(roomId: string, filePath: string, state: FileState) {
+  pubClient
+    .publish(
+      "doc-sync",
+      JSON.stringify({
+        roomId,
+        filePath,
+        state,
+        instanceId: process.pid,
+      })
+    )
+    .catch(() => {});
+}
 
 // ============================================================
 // ROOM HYDRATION HELPER
@@ -518,9 +563,15 @@ io.on("connection", (socket: Socket) => {
       fileCache.set(filePath, state);
     }
 
-    // Version Check
-    // If client is sending an update with matching version, accept and increment
-    if (clientVersion === state.version) {
+    // Version Check & Monotonic Concurrency Control
+    // 1. clientVersion === state.version: Normal in-order edit.
+    // 2. state.updatedBy === senderId: Sequential typing from same author.
+    //    Due to network RTT / pipelining, consecutive keystrokes from the active
+    //    typing user arrive with clientVersion <= state.version. Because TCP/WS
+    //    guarantees FIFO delivery, these are strictly newer edits and must NOT be rejected.
+    const isSameAuthor = Boolean(state.updatedBy && state.updatedBy === senderId);
+
+    if (clientVersion === state.version || isSameAuthor) {
       state.version += 1;
       state.content = newContent;
       if (language) state.language = language;
@@ -543,12 +594,15 @@ io.on("connection", (socket: Socket) => {
         fileId: state.id,
         filePath: state.path,
         version: state.version,
+        updateId: (payload as any).updateId,
       });
 
       // Debounced DB persistence
       schedulePersist(roomId);
+      broadcastDocSync(roomId, state.path, state);
     } else if (clientVersion < state.version) {
-      // Stale update! Reject and return authoritative version & content
+      // Stale update from a DIFFERENT author who hasn't observed state.version yet.
+      // Reject and send authoritative state so client can reconcile.
       socket.emit("sync_required", {
         roomId,
         fileId: state.id,
@@ -559,9 +613,10 @@ io.on("connection", (socket: Socket) => {
         message: "Stale document version rejected. Synchronized with server authoritative state.",
       });
     } else {
-      // Client is somehow ahead of server — accept and sync server version
-      state.version = clientVersion + 1;
+      // Client is ahead of server (optimistic increments) — accept and advance server version
+      state.version = Math.max(state.version + 1, clientVersion + 1);
       state.content = newContent;
+      if (language) state.language = language;
       state.updatedAt = new Date();
       state.updatedBy = senderId;
 
@@ -579,9 +634,11 @@ io.on("connection", (socket: Socket) => {
         fileId: state.id,
         filePath: state.path,
         version: state.version,
+        updateId: (payload as any).updateId,
       });
 
       schedulePersist(roomId);
+      broadcastDocSync(roomId, state.path, state);
     }
   });
 
@@ -951,22 +1008,51 @@ async function flushToDB(roomId: string) {
 
   try {
     for (const state of fileCache.values()) {
-      await prisma.file.upsert({
-        where: { roomId_path: { roomId, path: state.path } },
-        create: {
+      // Version-conditional atomic write: only overwrite DB if state.version >= existing DB version
+      const updated = await prisma.file.updateMany({
+        where: {
           roomId,
           path: state.path,
-          name: state.name,
-          content: state.content,
-          language: state.language,
-          version: state.version,
+          version: { lte: state.version },
         },
-        update: {
+        data: {
           content: state.content,
           language: state.language,
           version: state.version,
         },
       });
+
+      // If no rows updated, either row doesn't exist yet, or DB has a strictly newer version
+      if (updated.count === 0) {
+        const existing = await prisma.file.findUnique({
+          where: { roomId_path: { roomId, path: state.path } },
+          select: { version: true },
+        });
+
+        if (!existing) {
+          try {
+            await prisma.file.create({
+              data: {
+                roomId,
+                path: state.path,
+                name: state.name,
+                content: state.content,
+                language: state.language,
+                version: state.version,
+              },
+            });
+          } catch {
+            // Concurrent creation race condition handled safely
+          }
+        } else if (existing.version > state.version) {
+          // Out-of-order write guard: database already has a strictly newer version
+          console.warn(
+            `[DB] Guarded out-of-order write for ${state.path}: DB has v${existing.version} > in-memory v${state.version}`
+          );
+          // Advance in-memory version so we never revert
+          state.version = existing.version;
+        }
+      }
     }
 
     const first = Array.from(fileCache.values())[0];
@@ -1033,6 +1119,8 @@ async function gracefulShutdown(signal: string) {
     try {
       await execEventsClient.unsubscribe();
       await execEventsClient.quit();
+      await docSyncSub.unsubscribe();
+      await docSyncSub.quit();
       await pubClient.quit();
       await subClient.quit();
       console.log("[CodeCollab Socket.IO] Redis clients disconnected.");

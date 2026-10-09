@@ -8,8 +8,10 @@ import type { ExecutionJobData, ExecutionResult } from "./types";
 
 const WORKER_ID = process.env.WORKER_ID || `worker-${process.pid}-${Math.random().toString(36).slice(2, 6)}`;
 const CONCURRENCY = Number(process.env.WORKER_CONCURRENCY) || 3;
-
-console.log(`[Worker:${WORKER_ID}] 🚀 Initializing execution worker (concurrency: ${CONCURRENCY})...`);
+const redisTarget = process.env.REDIS_URL
+  ? (process.env.REDIS_URL.includes("@") ? process.env.REDIS_URL.split("@")[1] : process.env.REDIS_URL)
+  : `${process.env.REDIS_HOST || "127.0.0.1"}:${process.env.REDIS_PORT || 6379}`;
+console.log(`[Worker:${WORKER_ID}] 🚀 Initializing execution worker on Redis: ${redisTarget} (concurrency: ${CONCURRENCY})...`);
 
 const pubClient = createRedisClient("worker-pub");
 const subClient = createRedisClient("worker-sub");

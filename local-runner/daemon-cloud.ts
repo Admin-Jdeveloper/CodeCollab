@@ -16,5 +16,5 @@ const CLOUD_REDIS_URL =
 process.env.REDIS_URL = CLOUD_REDIS_URL;
 
 console.log(`[Daemon:CloudBridge] 🌐 Connecting to Cloud Redis to serve deployed web app...`);
-
-import "./daemon";
+// Use dynamic import so process.env.REDIS_URL is evaluated before any child modules are initialized
+await import("./daemon");

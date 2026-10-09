@@ -917,7 +917,7 @@ export default function LandingPage() {
         </section>
 
         {/* ── Engineering Credibility Strip (Logo & Tech Stack Wall) ───────── */}
-        <section className="border-t border-[#D4D4D4] dark:border-[#27272A] bg-[#FFFFFF]/60 dark:bg-[#000000]/60 py-6">
+        {/* <section className="border-t border-[#D4D4D4] dark:border-[#27272A] bg-[#FFFFFF]/60 dark:bg-[#000000]/60 py-6">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
             <div className="flex flex-wrap items-center justify-between gap-6 sm:gap-8">
               <span className="text-xs font-mono text-[#52525B] dark:text-[#A1A1AA] uppercase tracking-wider">
@@ -945,7 +945,7 @@ export default function LandingPage() {
               </div>
             </div>
           </div>
-        </section>
+        </section> */}
       </main>
 
       {/* ── Footer ────────────────────────────────────────────────────────── */}
@@ -954,7 +954,7 @@ export default function LandingPage() {
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[#10B981]/10 border border-[#10B981]/25 text-[#059669] dark:text-[#34D399] font-medium text-[11px]">
               <span className="w-1.5 h-1.5 rounded-full bg-[#10B981]" />
-              <span>Operational</span>
+              <span>LIVE</span>
             </div>
             <span>CodeCollab Studio</span>
           </div>
@@ -967,7 +967,7 @@ export default function LandingPage() {
               Sign In
             </Link>
             <span>•</span>
-            <span>Real-Time Collaborative Workspace</span>
+            <span>MADE BY HEISENBERG</span>
           </div>
         </div>
       </footer>

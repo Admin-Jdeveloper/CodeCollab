@@ -167,6 +167,9 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof import("monaco-editor") | null>(null);
   const codeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastLocalEditTimeRef = useRef<number>(0);
+  const activeFilePathRef = useRef<string | null>(null);
+  activeFilePathRef.current = activeFilePath;
 
   // ── Left Sidebar Tab: Files vs VCS ────────────────────────────────────────
   const [sidebarTab, setSidebarTab] = useState<"files" | "vcs">("files");
@@ -264,6 +267,12 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     if (!model) return;
     if (model.getValue() === code) return;
 
+    // Clear any pending debounce so we don't overwrite remote edits with stale local debounces
+    if (codeDebounceRef.current) {
+      clearTimeout(codeDebounceRef.current);
+      codeDebounceRef.current = null;
+    }
+
     const prevPos = editorRef.current.getPosition();
     const prevSelections = editorRef.current.getSelections();
 
@@ -319,13 +328,28 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     emitFileRenamed,
   } = useRoomSocket(roomId, currentUserId, currentUserName, {
     onRoomState: ({ files: remoteFiles }) => {
-      const wsFiles: WorkspaceFile[] = remoteFiles.map((f) => ({
-        id: f.id,
-        path: f.path,
-        name: f.name || (f.path.split("/").pop() ?? f.path),
-        language: f.language,
-        content: f.content,
-      }));
+      const isActivelyEditing = Date.now() - lastLocalEditTimeRef.current < 3000;
+      const localCode = editorRef.current?.getModel()?.getValue();
+
+      const wsFiles: WorkspaceFile[] = remoteFiles.map((f) => {
+        // If reconnecting while user is actively typing in activeFilePath, protect local buffer
+        if (isActivelyEditing && f.path === activeFilePathRef.current && localCode) {
+          return {
+            id: f.id,
+            path: f.path,
+            name: f.name || (f.path.split("/").pop() ?? f.path),
+            language: f.language,
+            content: localCode,
+          };
+        }
+        return {
+          id: f.id,
+          path: f.path,
+          name: f.name || (f.path.split("/").pop() ?? f.path),
+          language: f.language,
+          content: f.content,
+        };
+      });
       setFiles(wsFiles);
       if (wsFiles.length > 0 && !activeFilePath) {
         setActiveFilePath(wsFiles[0]!.path);
@@ -339,6 +363,18 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     },
 
     onSyncRequired: ({ filePath, content }) => {
+      const isCurrentlyActive = filePath === activeFilePathRef.current;
+      const isActivelyTyping = isCurrentlyActive && (Date.now() - lastLocalEditTimeRef.current < 2500);
+
+      if (isActivelyTyping && editorRef.current) {
+        // Preserve local editor keystrokes; re-emit with authoritative version
+        const currentModelText = editorRef.current.getModel()?.getValue();
+        if (currentModelText && currentModelText !== content) {
+          emitCodeChange(filePath, currentModelText, activeLanguage);
+          return;
+        }
+      }
+
       updateFileContent(filePath, content);
       const now = Date.now();
       if (now - lastSyncToastRef.current > 5000) {
@@ -580,6 +616,8 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
 
       if (isRemoteUpdateRef.current) return;
 
+      lastLocalEditTimeRef.current = Date.now();
+
       if (activeFilePath) {
         setFiles((prev) =>
           prev.map((f) => (f.path === activeFilePath ? { ...f, content: newCode } : f))
@@ -588,9 +626,13 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
 
       if (codeDebounceRef.current) clearTimeout(codeDebounceRef.current);
       codeDebounceRef.current = setTimeout(() => {
-        if (activeFilePath) {
-          emitCodeChange(activeFilePath, newCode, activeLanguage);
-        }
+        const targetPath = activeFilePathRef.current;
+        if (!targetPath) return;
+        const currentModel = editorRef.current?.getModel();
+        const codeToEmit = (targetPath === activeFilePath && currentModel)
+          ? currentModel.getValue()
+          : newCode;
+        emitCodeChange(targetPath, codeToEmit, activeLanguage);
       }, 30);
     },
     [activeFilePath, activeLanguage, emitCodeChange]

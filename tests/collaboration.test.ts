@@ -1,4 +1,5 @@
 import { io, type Socket } from "socket.io-client";
+import { spawn, execSync, type ChildProcess } from "node:child_process";
 
 const SOCKET_URL_1 = process.env.SOCKET_URL_1 || "http://localhost:3001";
 
@@ -38,14 +39,43 @@ async function runCollaborationTests() {
     }
   }
 
+  let serverProc: ChildProcess | null = null;
   let client1: Socket | null = null;
   let client2: Socket | null = null;
 
   try {
-    // 1. Connect two clients
-    client1 = await createClient();
+    // 1. Connect two clients (auto-spawn test server if not already running)
+    const redisUrl =
+      process.env.CLOUD_REDIS_URL ||
+      "redis://default:FD8mJTm7FM8K9QkRB0NLF5mgnYDPXmGx@touchable-simple-pest-36749.db.redis.io:14692";
+
+    try {
+      client1 = await createClient();
+    } catch {
+      console.log("  Socket server not running on port 3001. Spawning test server...");
+      serverProc = spawn("bun", ["socket-server.ts"], {
+        cwd: "./backend",
+        env: { ...process.env, SOCKET_PORT: "3001", REDIS_URL: redisUrl },
+        shell: true,
+      });
+      const readyPromise = new Promise<void>((resolve) => {
+        serverProc!.stdout?.on("data", (data) => {
+          if (data.toString().includes("Sync server running on port")) resolve();
+        });
+      });
+      await Promise.race([readyPromise, wait(6000)]);
+      client1 = await createClient();
+    }
+
     client2 = await createClient();
     assert(client1.connected && client2.connected, "Two clients successfully connected to Socket.IO cluster");
+
+    const waitFor = async (fn: () => boolean, maxMs = 4500) => {
+      const start = Date.now();
+      while (!fn() && Date.now() - start < maxMs) {
+        await wait(50);
+      }
+    };
 
     // 2. Client 1 joins room
     let roomStateReceived = false;
@@ -63,7 +93,7 @@ async function runCollaborationTests() {
       userName: "Alice",
     });
 
-    await wait(600);
+    await waitFor(() => roomStateReceived, 6000);
     assert(roomStateReceived, "Client 1 received room_state upon joining");
 
     // 3. Client 2 joins room and receives presence
@@ -78,7 +108,7 @@ async function runCollaborationTests() {
       userName: "Bob",
     });
 
-    await wait(300);
+    await waitFor(() => user1ReceivedJoined, 3000);
     assert(user1ReceivedJoined, "Client 1 received user_joined notification for Client 2");
 
     // 4. Client 1 makes an edit with matching version (Version Accepted & Incremented)
@@ -106,7 +136,7 @@ async function runCollaborationTests() {
       senderId: "user-1",
     });
 
-    await wait(400);
+    await waitFor(() => client1ReceivedAck && client2ReceivedCodeUpdate, 3000);
     assert(client1ReceivedAck, "Client 1 received code_ack acknowledging valid version edit");
     assert(client2ReceivedCodeUpdate, "Client 2 received authoritative code_update broadcast");
     assert(newVersion === initialVersion + 1, `Version was incremented monotonically: ${initialVersion} -> ${newVersion}`);
@@ -127,7 +157,7 @@ async function runCollaborationTests() {
       senderId: "user-2",
     });
 
-    await wait(400);
+    await waitFor(() => syncRequiredReceived, 3000);
     assert(syncRequiredReceived, "Server rejected stale edit and emitted sync_required with authoritative state");
 
     // 6. Transient Cursor Position Tracking
@@ -144,7 +174,7 @@ async function runCollaborationTests() {
       cursor: { lineNumber: 42, column: 10 },
     });
 
-    await wait(300);
+    await waitFor(() => client2ReceivedCursor, 2000);
     assert(client2ReceivedCursor, "Client 2 received transient cursor_update without DB persistence");
 
     // 7. Client Disconnect and Presence Cleanup
@@ -156,7 +186,7 @@ async function runCollaborationTests() {
     });
 
     client1.disconnect();
-    await wait(400);
+    await waitFor(() => client2ReceivedLeave, 2000);
     assert(client2ReceivedLeave, "Client 2 received user_left on Client 1 disconnect");
 
     // 8. Client 1 Reconnects & Re-synchronizes
@@ -175,7 +205,7 @@ async function runCollaborationTests() {
       lastKnownVersions: { "/main.js": initialVersion },
     });
 
-    await wait(400);
+    await waitFor(() => reconnectedRoomState, 4000);
     assert(reconnectedRoomState, "Client 1 reconnected, rejoined room, and synchronized latest authoritative version");
 
     // 9. Deterministic File Room Join (project:<projectId>:file:<fileId>)
@@ -193,7 +223,7 @@ async function runCollaborationTests() {
       filePath: "/main.js",
     });
 
-    await wait(300);
+    await waitFor(() => fileStateReceived, 3000);
     assert(fileStateReceived && fileStateVersion === newVersion, "Deterministic join_file returned verified document, version, and joined channel");
 
     // 10. Multiple Rooms & Room Isolation
@@ -213,7 +243,7 @@ async function runCollaborationTests() {
       userName: "Charlie",
     });
 
-    await wait(300);
+    await wait(600);
 
     // Client 1 edits in testRoom (Room A)
     client1.emit("code_change", {
@@ -224,7 +254,7 @@ async function runCollaborationTests() {
       senderId: "user-1",
     });
 
-    await wait(400);
+    await wait(500);
     assert(!client3ReceivedRoomAUpdate, "Room Isolation verified: Client 3 in Room B received no updates from Room A");
 
     client3.disconnect();
@@ -235,6 +265,13 @@ async function runCollaborationTests() {
   } finally {
     client1?.disconnect();
     client2?.disconnect();
+    if (serverProc) {
+      if (process.platform === "win32") {
+        try { if ((serverProc as any).pid) execSync(`taskkill /pid ${(serverProc as any).pid} /T /F`, { stdio: "ignore" }); } catch {}
+      } else {
+        try { serverProc.kill("SIGKILL"); } catch {}
+      }
+    }
   }
 
   console.log("\n-------------------------------------------------");

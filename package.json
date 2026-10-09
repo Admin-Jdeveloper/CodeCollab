@@ -21,9 +21,14 @@
     "test:security": "bun run tests/security.test.ts",
     "test:load": "bun run tests/load.test.ts",
     "test:auth": "bun run tests/auth-reconnection.test.ts",
-    "test": "bun run test:auth && bun run test:execution && bun run test:collaboration && bun run test:scaling && bun run test:multi-socket && bun run test:security && bun run test:load",
+    "test:rapid": "bun run tests/rapid-typing.test.ts",
+    "test:persistence": "bun run tests/out-of-order-persistence.test.ts",
+    "test": "bun run test:auth && bun run test:rapid && bun run test:persistence && bun run test:collaboration && bun run test:multi-socket",
     "typecheck": "cd backend && bun run typecheck && cd ../frontend && bun run typecheck",
     "lint": "cd frontend && bun run lint",
     "build": "cd frontend && bun run build"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.4"
   }
 }

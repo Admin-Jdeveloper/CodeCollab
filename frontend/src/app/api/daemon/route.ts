@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getBackendUrl } from "@/lib/urlUtils";
 
-const BACKEND_URL = (process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:3000").replace(/\/+$/, "");
+const BACKEND_URL = (process.env.BACKEND_URL || getBackendUrl()).replace(/\/+$/, "");
 
 export async function GET() {
   try {

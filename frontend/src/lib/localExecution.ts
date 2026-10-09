@@ -9,6 +9,7 @@
  */
 
 import { parseDiagnostics, type DiagnosticItem } from "./errorParser";
+import { getBackendUrl } from "./urlUtils";
 
 export interface ExecutionRequest {
   language: string; // widened — supports any workspace file language
@@ -111,7 +112,7 @@ async function executeViaDaemon(req: ExecutionRequest): Promise<ExecutionResult>
   // 2. Direct backend API fallback
   if (!res || !res.ok) {
     try {
-      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:3000";
+      const backendUrl = getBackendUrl();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
       const runRes = await fetch(`${backendUrl}/api/execution/run`, {

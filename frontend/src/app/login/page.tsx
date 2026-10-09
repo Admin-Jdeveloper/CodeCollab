@@ -309,11 +309,11 @@ function LoginForm() {
           {/* Quick Demo 1-Click Profiles */}
           <div className="mt-5 pt-4 border-t border-[#D4D4D4] dark:border-[#27272A]">
             <div className="text-xs font-medium text-[#71717A] dark:text-[#A1A1AA] mb-2 flex items-center justify-between">
-              <span className="flex items-center gap-1.5 text-[#18181B] dark:text-[#F5F5F5] text-[11px] font-semibold">
+               {/* <span className="flex items-center gap-1.5 text-[#18181B] dark:text-[#F5F5F5] text-[11px] font-semibold">
                 <Terminal className="w-3 h-3 text-[#7DB9E8] dark:text-[#A8D8FF]" />
                 1-Click Demo Profiles
-              </span>
-              <span className="text-[10px] text-[#71717A] dark:text-[#52525B] font-mono">Test sync</span>
+              </span> */}
+              {/* <span className="text-[10px] text-[#71717A] dark:text-[#52525B] font-mono">Test sync</span> */}
             </div>
             <div className="grid grid-cols-2 gap-2">
               <button
@@ -322,7 +322,7 @@ function LoginForm() {
                 disabled={loading}
                 className="py-1.5 px-2.5 rounded-lg bg-[#F2F2F0] dark:bg-[#181818] hover:bg-[#E8E1D5]/80 dark:hover:bg-[#27272A] border border-[#D4D4D4] dark:border-[#27272A] text-[11px] font-medium text-[#18181B] dark:text-[#E8E1D5] transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
               >
-                <span>Alice (Peer 1)</span>
+                <span>STUDENT</span>
               </button>
               <button
                 type="button"
@@ -330,7 +330,7 @@ function LoginForm() {
                 disabled={loading}
                 className="py-1.5 px-2.5 rounded-lg bg-[#F2F2F0] dark:bg-[#181818] hover:bg-[#E8E1D5]/80 dark:hover:bg-[#27272A] border border-[#D4D4D4] dark:border-[#27272A] text-[11px] font-medium text-[#18181B] dark:text-[#E8E1D5] transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
               >
-                <span>Bob (Peer 2)</span>
+                <span>TEACHER</span>
               </button>
             </div>
           </div>

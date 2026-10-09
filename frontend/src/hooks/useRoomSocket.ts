@@ -223,10 +223,11 @@ export function useRoomSocket(
     };
 
     const onRoomState = (state: RoomStatePayload) => {
-      // Record initial versions
+      // Record initial versions monotonically
       if (state.files) {
         for (const f of state.files) {
-          fileVersionsRef.current.set(f.path, f.version || 1);
+          const current = fileVersionsRef.current.get(f.path) || 1;
+          fileVersionsRef.current.set(f.path, Math.max(current, f.version || 1));
         }
       }
       callbacksRef.current.onRoomState(state);
@@ -249,20 +250,23 @@ export function useRoomSocket(
     }) => {
       const newText = content !== undefined ? content : code ?? "";
       if (version !== undefined) {
-        fileVersionsRef.current.set(filePath, version);
+        const current = fileVersionsRef.current.get(filePath) || 1;
+        fileVersionsRef.current.set(filePath, Math.max(current, version));
       }
       callbacksRef.current.onCodeUpdate(filePath, newText, senderId, version);
     };
 
-    // Server acknowledged local edit
+    // Server acknowledged local edit — advance monotonically
     const onCodeAck = ({ filePath, version }: { filePath: string; version: number }) => {
-      fileVersionsRef.current.set(filePath, version);
+      const current = fileVersionsRef.current.get(filePath) || 1;
+      fileVersionsRef.current.set(filePath, Math.max(current, version));
     };
 
     // Server rejected stale edit — sync required
     const onSyncRequired = (payload: SyncRequiredPayload) => {
       console.warn(`[Socket] Stale version reconciliation for ${payload.filePath} (v${payload.version})`);
-      fileVersionsRef.current.set(payload.filePath, payload.version);
+      const current = fileVersionsRef.current.get(payload.filePath) || 1;
+      fileVersionsRef.current.set(payload.filePath, Math.max(current, payload.version));
       callbacksRef.current.onSyncRequired?.(payload);
     };
 
@@ -387,9 +391,12 @@ export function useRoomSocket(
   // EMIT HELPERS
   // --------------------------------------------------------
 
-  /** Emit code change with current authoritative version */
+  /** Emit code change with monotonic optimistic version tracking */
   const emitCodeChange = useCallback((filePath: string, code: string, language?: string, fileId?: string) => {
     const currentVersion = fileVersionsRef.current.get(filePath) || 1;
+    // Advance local version optimistically so rapid keystrokes pipeline monotonically
+    fileVersionsRef.current.set(filePath, currentVersion + 1);
+    const updateId = `${userId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     socketRef.current?.emit("code_change", {
       roomId,
       fileId,
@@ -399,6 +406,7 @@ export function useRoomSocket(
       code,
       senderId: userId,
       language,
+      updateId,
     });
   }, [roomId, userId]);
 
