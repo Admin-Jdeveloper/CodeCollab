@@ -63,12 +63,25 @@ const redis = createRedisClient("api");
 const rateLimiter = new ExecutionRateLimiter(redis);
 
 // ── Health & Readiness Probes ────────────────────────────────
-app.get("/health", (_req, res) => {
-  if (isShuttingDown) {
-    return res.status(503).json({ status: "shutting_down" });
-  }
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
-});
+app.route("/health")
+  .get((_req, res) => {
+    if (isShuttingDown) {
+      return res.status(503).json({ status: "shutting_down", service: "api" });
+    }
+    res.setHeader("Content-Type", "application/json");
+    res.status(200).json({
+      status: "ok",
+      service: "api",
+      message: "API service is alive",
+    });
+  })
+  .head((_req, res) => {
+    if (isShuttingDown) {
+      return res.sendStatus(503);
+    }
+    res.setHeader("Content-Type", "application/json");
+    res.sendStatus(200);
+  });
 
 app.get("/ready", async (_req, res) => {
   if (isShuttingDown) {
@@ -144,6 +157,112 @@ app.post("/api/auth/verify", async (req, res) => {
   } catch (err: any) {
     console.error("Verify error:", err);
     return res.status(500).json({ success: false, error: "Authentication verification failed", details: err.message });
+  }
+});
+
+// OAuth sync / upsert endpoint (called securely by NextAuth during OAuth signIn callback)
+app.post("/api/auth/oauth-sync", async (req, res) => {
+  try {
+    const { provider, providerAccountId, email, name, image, emailVerified, oauthData } = req.body;
+    if (!provider || !providerAccountId) {
+      return res.status(400).json({ error: "Missing provider or providerAccountId" });
+    }
+
+    const cleanEmail = email ? String(email).trim().toLowerCase() : null;
+
+    // 1. Check if Account relationship already exists
+    const existingAccount = await prisma.account.findUnique({
+      where: {
+        provider_providerAccountId: {
+          provider,
+          providerAccountId: String(providerAccountId),
+        },
+      },
+      include: { user: true },
+    });
+
+    if (existingAccount && existingAccount.user) {
+      // User and account already linked! Update profile data if changed
+      const updatedUser = await prisma.user.update({
+        where: { id: existingAccount.userId },
+        data: {
+          name: name || existingAccount.user.name,
+          image: image || existingAccount.user.image,
+          emailVerified: emailVerified ? new Date(emailVerified) : existingAccount.user.emailVerified,
+        },
+        select: { id: true, email: true, name: true, image: true, emailVerified: true },
+      });
+
+      return res.json({ success: true, user: updatedUser, isNew: false });
+    }
+
+    // 2. If account does not exist, check if a User exists with this verified email
+    let user = cleanEmail ? await prisma.user.findUnique({ where: { email: cleanEmail } }) : null;
+
+    if (!user) {
+      // Create new User in PostgreSQL
+      user = await prisma.user.create({
+        data: {
+          email: cleanEmail,
+          name: name || (cleanEmail ? cleanEmail.split("@")[0] : "Developer"),
+          image: image || (cleanEmail ? `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(cleanEmail)}` : null),
+          emailVerified: emailVerified ? new Date(emailVerified) : new Date(),
+        },
+      });
+    } else {
+      // Existing user found by email — update profile
+      user = await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          name: user.name || name,
+          image: user.image || image,
+          emailVerified: user.emailVerified || (emailVerified ? new Date(emailVerified) : new Date()),
+        },
+      });
+    }
+
+    // 3. Link OAuth Account to User
+    await prisma.account.upsert({
+      where: {
+        provider_providerAccountId: {
+          provider,
+          providerAccountId: String(providerAccountId),
+        },
+      },
+      create: {
+        userId: user.id,
+        type: oauthData?.type || "oauth",
+        provider,
+        providerAccountId: String(providerAccountId),
+        refresh_token: oauthData?.refresh_token || null,
+        access_token: oauthData?.access_token || null,
+        expires_at: oauthData?.expires_at ? Number(oauthData.expires_at) : null,
+        token_type: oauthData?.token_type || null,
+        scope: oauthData?.scope || null,
+        id_token: oauthData?.id_token || null,
+        session_state: oauthData?.session_state || null,
+      },
+      update: {
+        refresh_token: oauthData?.refresh_token || undefined,
+        access_token: oauthData?.access_token || undefined,
+        expires_at: oauthData?.expires_at ? Number(oauthData.expires_at) : undefined,
+        token_type: oauthData?.token_type || undefined,
+        scope: oauthData?.scope || undefined,
+        id_token: oauthData?.id_token || undefined,
+        session_state: oauthData?.session_state || undefined,
+      },
+    });
+
+    console.log(`[Auth] OAuth user linked successfully: ${user.id} (${provider}:${providerAccountId}) - ${user.email}`);
+
+    return res.status(200).json({
+      success: true,
+      user: { id: user.id, email: user.email, name: user.name, image: user.image },
+      isNew: true,
+    });
+  } catch (err: any) {
+    console.error("[Auth] OAuth sync error:", err);
+    return res.status(500).json({ error: "Failed to synchronize OAuth user", details: err.message });
   }
 });
 
@@ -715,50 +834,99 @@ app.post("/api/room/:id/rollback/:commitId", async (req, res) => {
 
     const filesSnapshot = commit.filesSnapshot as Array<{ path: string; name: string; language: string; content: string }> | null;
 
-    if (filesSnapshot && filesSnapshot.length > 0) {
-      // Restore each file in the snapshot
-      console.log(`[VCS] REST rollback restoring ${filesSnapshot.length} file(s)`);
-      for (const f of filesSnapshot) {
-        await prisma.file.upsert({
-          where: { roomId_path: { roomId, path: f.path } },
-          create: { roomId, path: f.path, name: f.name, content: f.content, language: f.language },
-          update: { content: f.content, language: f.language },
-        });
-      }
-      // Update Room legacy fields
-      await prisma.room.update({
-        where: { id: roomId },
-        data: { code: filesSnapshot[0]!.content, language: filesSnapshot[0]!.language },
-      });
-    } else {
-      // Legacy single-file rollback
-      console.log(`[VCS] REST rollback using legacy code field`);
-      await prisma.room.update({
-        where: { id: roomId },
-        data: { code: commit.code, language: commit.language },
-      });
+    if (!filesSnapshot || filesSnapshot.length === 0) {
+      return res.status(400).json({ error: "Invalid commit snapshot: no files found in snapshot" });
     }
 
-    // Record a rollback marker commit
-    const rollbackMarker = await prisma.commit.create({
-      data: {
-        roomId,
-        message: `↩ Rollback to: "${commit.message}"`,
-        code: commit.code,
-        language: commit.language,
-        filesSnapshot: commit.filesSnapshot ?? undefined,
-        authorName: req.body.authorName || "System",
-        userId: req.body.userId || null,
-      },
+    // Execute atomic transactional rollback
+    const rollbackResult = await prisma.$transaction(async (tx) => {
+      // 1. Fetch current files in the workspace
+      const currentFiles = await tx.file.findMany({
+        where: { roomId },
+      });
+
+      const snapshotPaths = new Set(filesSnapshot.map((f) => f.path));
+
+      // 2. Remove files that do not exist in the snapshot (clean restoration)
+      const filesToDelete = currentFiles.filter((f) => !snapshotPaths.has(f.path));
+      if (filesToDelete.length > 0) {
+        await tx.file.deleteMany({
+          where: {
+            roomId,
+            id: { in: filesToDelete.map((f) => f.id) },
+          },
+        });
+      }
+
+      // 3. Upsert and update all files present in the snapshot with incremented versions
+      for (const f of filesSnapshot) {
+        const existing = currentFiles.find((cf) => cf.path === f.path);
+        const nextVersion = (existing?.version || 1) + 1;
+
+        await tx.file.upsert({
+          where: { roomId_path: { roomId, path: f.path } },
+          create: {
+            roomId,
+            path: f.path,
+            name: f.name,
+            content: f.content,
+            language: f.language,
+            version: nextVersion,
+          },
+          update: {
+            name: f.name,
+            content: f.content,
+            language: f.language,
+            version: nextVersion,
+          },
+        });
+      }
+
+      // 4. Update legacy room fields for backward compatibility
+      await tx.room.update({
+        where: { id: roomId },
+        data: {
+          code: filesSnapshot[0]!.content,
+          language: filesSnapshot[0]!.language,
+        },
+      });
+
+      // 5. Record immutable rollback marker commit
+      const marker = await tx.commit.create({
+        data: {
+          roomId,
+          message: `↩ Rollback to: "${commit.message}"`,
+          code: filesSnapshot[0]!.content,
+          language: filesSnapshot[0]!.language,
+          filesSnapshot: filesSnapshot as any,
+          authorName: req.body.authorName || "System",
+          userId: userId || null,
+        },
+      });
+
+      return marker;
     });
 
-    console.log(`[VCS] REST rollback complete — room ${roomId} restored to "${commit.message}"`);
+    console.log(`[VCS] REST atomic transactional rollback complete — room ${roomId} restored to "${commit.message}"`);
+
+    // Notify Redis/Socket.IO layer if available so active memory caches invalidate
+    try {
+      await redis.publish(
+        "workspace-rollback",
+        JSON.stringify({
+          roomId,
+          commitId,
+          filesSnapshot,
+          markerId: rollbackResult.id,
+        })
+      );
+    } catch {}
 
     return res.json({
       success: true,
       filesSnapshot,
       rolledBackTo: { id: commit.id, message: commit.message, createdAt: commit.createdAt },
-      markerCommit: { id: rollbackMarker.id },
+      markerCommit: { id: rollbackResult.id },
     });
   } catch (err: any) {
     console.error("[VCS] REST rollback FAILED:", err);

@@ -241,7 +241,6 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
   const lastRollbackToastRef = useRef<{ time: number; msg: string }>({ time: 0, msg: "" });
   const lastCommitToastRef = useRef<{ time: number; id: string; msg: string }>({ time: 0, id: "", msg: "" });
   const lastUserEventRef = useRef<Map<string, number>>(new Map());
-  const lastSyncToastRef = useRef<number>(0);
 
   // ── Presence & chat state ─────────────────────────────────────────────────
   const [connectedUsers, setConnectedUsers] = useState<PresenceUser[]>([]);
@@ -361,7 +360,6 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
   // ── Socket integration ────────────────────────────────────────────────────
   const {
     connectionStatus,
-    emitCodeChange,
     emitCursor,
     emitLanguageChange,
     emitChatMessage,
@@ -513,15 +511,31 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
       if (filesSnapshot && filesSnapshot.length > 0) {
         const wsFiles: WorkspaceFile[] = filesSnapshot.map((f) => ({
           path: f.path,
-          name: f.path.split("/").pop() ?? f.path,
+          name: f.name || (f.path.split("/").pop() ?? f.path),
           language: f.language,
           content: f.content,
         }));
         setFiles(wsFiles);
 
-        // Transactionally update Yjs documents so all connected peers converge
+        // Update openFilePaths: keep only open tabs that still exist in the restored snapshot
+        const snapshotPaths = new Set(filesSnapshot.map((f) => f.path));
+        setOpenFilePaths((prev) => {
+          const valid = prev.filter((p) => snapshotPaths.has(p));
+          return valid.length > 0 ? valid : [filesSnapshot[0]!.path];
+        });
+
+        // Clean up Yjs docs for removed files
+        if (yjsManagerRef.current) {
+          for (const oldFile of files) {
+            if (!snapshotPaths.has(oldFile.path)) {
+              yjsManagerRef.current.removeFile(oldFile.path);
+            }
+          }
+        }
+
+        // Transactionally update Yjs documents for all snapshot files so all connected peers converge
         for (const snap of filesSnapshot) {
-          const doc = yjsManagerRef.current?.getOrCreate(snap.path).doc;
+          const doc = yjsManagerRef.current?.getOrCreate(snap.path, snap.content).doc;
           if (doc) {
             const ytext = doc.getText("monaco");
             if (ytext.toString() !== snap.content) {
@@ -533,9 +547,10 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
           }
         }
 
-        const currentActive = activeFilePath ?? filesSnapshot[0]!.path;
-        const activeSnap = filesSnapshot.find((f) => f.path === currentActive) ?? filesSnapshot[0]!;
-        setActiveFilePath(activeSnap.path);
+        const currentActive = activeFilePath && snapshotPaths.has(activeFilePath)
+          ? activeFilePath
+          : filesSnapshot[0]!.path;
+        setActiveFilePath(currentActive);
       } else {
         if (activeFilePath) {
           const doc = yjsManagerRef.current?.getOrCreate(activeFilePath).doc;

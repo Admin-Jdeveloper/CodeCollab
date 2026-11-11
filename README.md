@@ -1,162 +1,131 @@
 # CodeCollab 🚀
 
-A scalable, reliable, and secure real-time collaborative coding platform with server-authoritative document versioning, containerized multi-language code execution, and distributed worker fleet architecture.
+A real-time collaborative coding platform engineered for low latency and zero state drift. Features Monaco-grade editing, server-authoritative document synchronization (Socket.IO + Yjs CRDTs), immutable Git-like workspace snapshots with atomic transactional rollbacks, and sandboxed Docker code execution.
 
 ---
 
-## Architecture Overview
+## 🏗️ System Architecture
 
 ```text
-Browser / Monaco Editor
-       │
-       ├──── Socket.IO ──── Redis Adapter ──── Socket.IO × N
-       │
-       └──── Run Code (HTTP REST API)
-                 │
-                 ▼
-             API / Server (Port 3000)
-                 │
-          ┌──────┴──────┐
-          ▼             ▼
-     PostgreSQL        Redis
-     (Port 5432)   Queue / PubSub
-                        │
-                        ▼
-                     BullMQ
-                        │
-             ┌──────────┼──────────┐
-             ▼          ▼          ▼
-          Worker 1   Worker 2   Worker N (Stateless Fleet)
-             │          │          │
-             └──────────┼──────────┘
-                        ▼
-               Restricted Docker Sandbox
-             (alpine:3.20, non-root, isolated)
-                        │
-                 C / C++ / Python /
-                 JavaScript / TypeScript
-                        │
-                        ▼
-                 Execution Result
-                        │
-             PostgreSQL + Redis Pub/Sub
-                        │
-                        ▼
-                 Socket.IO Server
-                        │
-                        ▼
-                 Client Browser (Terminal Output)
+┌────────────────────────────────────────────────────────────────────────┐
+│                        Next.js 15 Client (Browser)                     │
+│    Monaco Editor • Yjs CRDT Binding • Multi-File Tree • VCS Panel      │
+└───────────────────┬────────────────────────────────┬───────────────────┘
+                    │ HTTPS REST                     │ WSS (Socket.IO)
+                    ▼                                ▼
+       ┌────────────────────────┐       ┌────────────────────────┐
+       │   Render Web Service   │       │   Render Web Service   │
+       │   "codecollab-api"     │       │  "codecollab-socket"   │
+       │   Port 3000            │       │   Port 3001            │
+       └───────────┬────────────┘       └───────────┬────────────┘
+                   │                                │
+                   ├───────────────┬────────────────┤
+                   ▼                                ▼
+       ┌────────────────────────┐       ┌────────────────────────┐
+       │   PostgreSQL 17        │       │   Redis 7              │
+       │   Users, Accounts,     │       │   Pub/Sub Adapter,     │
+       │   Rooms, Files,        │       │   BullMQ Queue,        │
+       │   Commit Snapshots     │       │   Rate Limiters        │
+       └────────────────────────┘       └───────────┬────────────┘
+                                                    │
+                                                    ▼
+                                        ┌────────────────────────┐
+                                        │ Execution Worker Fleet │
+                                        │ BullMQ + Docker Pool   │
+                                        └────────────────────────┘
 ```
 
 ---
 
-## Key Features
+## ⚡ Tech Stack
 
-- **Real-Time Collaboration**: Multi-user live editing powered by Monaco Editor and Socket.IO with `@socket.io/redis-adapter` for cluster-wide broadcast.
-- **Server-Authoritative Document Versioning**: Monotonically increasing document versions reject stale edits (`SYNC_REQUIRED`) and prevent race conditions.
-- **Multi-File Workspace**: Hierarchical file tree with live file creation, deletion, renaming, and deterministic room channels (`project:<id>:file:<id>`).
-- **Distributed Execution Queue**: Asynchronous `POST /api/execution/run` returning `202 Accepted` immediately, backed by BullMQ on Redis.
-- **Stateless Worker Fleet**: Dynamic worker pools consuming from BullMQ with automatic load distribution, crash failover, and heartbeats.
-- **Multi-Language Docker Sandbox**:
-  - **C** (`gcc -O2 -Wall`)
-  - **C++** (`g++ -O2 -Wall`)
-  - **Python** (`python3 -u`)
-  - **JavaScript** (`node`)
-  - **TypeScript** (`tsx`)
-- **Zero-Trust Security Model**:
-  - Non-root execution (`sandbox:1001`)
-  - Linux capabilities dropped (`--cap-drop ALL`)
-  - Network disabled (`--network none`)
-  - Hard memory cap (`--memory 256m --memory-swap 256m`)
-  - CPU cap (`--cpus 1.0`)
-  - Process limit (`--pids-limit 64`) to prevent fork bombs
-  - Output stream truncation (64 KB)
-  - Automatic ephemeral container lifecycle cleanup
-- **Reliability & Rate Limiting**:
-  - Multi-level rate limiters for executions, socket connections, room joins, and project creations.
-  - Client disconnect resilience (jobs complete even if user closes the tab).
-  - Target container cancellation on demand (`docker rm -f`).
-  - Idempotent job finalization guards.
+- **Frontend**: Next.js 15 (App Router), React 19, Monaco Editor (`@monaco-editor/react`), Yjs, Tailwind CSS v4, Lucide Icons, NextAuth v5 (Auth.js) with Google OAuth.
+- **Backend API**: Express 5 on Bun runtime, Prisma ORM 7 (`@prisma/adapter-pg`), PostgreSQL, BullMQ, Redis.
+- **Real-Time Sync**: Socket.IO 4.8 with Redis Adapter for horizontal multi-instance scaling, Yjs binary CRDT protocol with monotonic server sequence locks.
+- **Code Execution**: Ephemeral Docker sandboxes with CPU/memory quotas, execution timeouts, and network isolation (`--network none`).
 
 ---
 
-## Quickstart
+## 🚀 Quick Start (Local Development)
 
-### Prerequisites
+### 1. Prerequisites
+- [Bun](https://bun.sh) (v1.1+)
+- [Docker Desktop](https://www.docker.com) (for local PostgreSQL & Redis)
 
-- [Bun](https://bun.sh/) (v1.2+) or Node.js (v20+)
-- [Docker](https://www.docker.com/) & Docker Compose
-- PostgreSQL (16+) & Redis (7+)
-
-### 1. Running with Docker Compose (Recommended)
-
-Start the entire fleet with one command:
-
+### 2. Start Infrastructure
 ```bash
-docker compose up --build -d
+docker compose up -d
+```
+This starts:
+- PostgreSQL on `localhost:5432` (`codeduo`)
+- Redis on `localhost:6379`
+
+### 3. Install Dependencies & Generate Database Client
+```bash
+bun install
+cd backend && bun install && bun run db:generate
+cd ../frontend && bun install
 ```
 
-Scale worker daemons dynamically:
-
+### 4. Environment Variables
+Copy and sanitize the environment templates:
 ```bash
-docker compose up -d --scale daemon=3
+cp backend/.env.example backend/.env
+cp frontend/.env.example frontend/.env.local
 ```
 
-Access the application:
-- **Web Interface:** [http://localhost:3003](http://localhost:3003)
-- **REST API:** [http://localhost:3000](http://localhost:3000)
-- **Socket.IO:** [http://localhost:3001](http://localhost:3001)
-
-### 2. Running Locally for Development
-
+### 5. Run Services
+In three separate terminal tabs (or using monorepo scripts):
 ```bash
-# 1. Start database & Redis
-docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=codeduo postgres:17-alpine
-docker run -d -p 6379:6379 redis:7-alpine
+# Terminal 1: REST API Server (Port 3000)
+cd backend && bun run dev
 
-# 2. Build the runner sandbox image
-docker build -t codecollab-runner:latest -f docker/Dockerfile.runner .
+# Terminal 2: Socket.IO Real-Time Sync (Port 3001)
+cd backend && bun run dev:socket
 
-# 3. Setup database schema
-cd backend
-bunx prisma migrate deploy
-
-# 4. Start services (in separate terminals or via root scripts)
-bun run dev:backend   # API server on port 3000
-bun run dev:socket    # Socket server on port 3001
-bun run worker        # BullMQ worker daemon
-bun run dev:frontend  # Next.js UI on port 3003
+# Terminal 3: Next.js Frontend (Port 3003)
+cd frontend && bun run dev
 ```
+
+Visit `http://localhost:3003` to start coding.
 
 ---
 
-## Testing & Quality Assurance
+## 🩺 Health-Check Endpoints (Render / Uptime Monitoring)
 
-CodeCollab includes an end-to-end automated test suite:
+Both backend services expose unauthenticated, zero-overhead GET `/health` routes for external monitors (e.g. UptimeRobot, Render keep-alive):
+
+- **REST API**:
+  `GET https://<YOUR-API-SERVICE>.onrender.com/health`
+  ```json
+  {
+    "status": "ok",
+    "service": "api",
+    "message": "API service is alive"
+  }
+  ```
+
+- **Socket.IO Sync**:
+  `GET https://<YOUR-SYNC-SERVICE>.onrender.com/health`
+  ```json
+  {
+    "status": "ok",
+    "service": "sync",
+    "message": "Socket.IO service is alive"
+  }
+  ```
+
+---
+
+## 🧪 Testing & Validation
 
 ```bash
-# Run all tests
+# Full test suite
 bun run test
 
-# Individual suites:
-bun run test:execution     # Sandbox multi-language runner tests
-bun run test:collaboration # Real-time sync, versioning, and presence tests
-bun run test:multi-socket  # Multi-node Socket.IO cluster Redis adapter tests
-bun run test:scaling       # Worker concurrency, cancellation, failover tests
-bun run test:security      # Comprehensive security and sandbox isolation tests
-bun run test:load          # High-throughput 100+ execution distributed load test
+# Typecheck both backend and frontend
+bun run typecheck
 
-# Static analysis:
-bun run typecheck          # TypeScript compiler verification (0 errors)
-bun run lint               # Code linting
-bun run build              # Next.js production build verification
+# Lint frontend
+bun run lint
 ```
-
----
-
-## Documentation
-
-- [Architecture Specification](file:///f:/anti/26-june-leetcode-v0-assignment-main/docs/ARCHITECTURE.md)
-- [Current System Architecture](file:///f:/anti/26-june-leetcode-v0-assignment-main/docs/CURRENT_ARCHITECTURE.md)
-- [Execution Security & Isolation Spec](file:///f:/anti/26-june-leetcode-v0-assignment-main/docs/EXECUTION_SECURITY.md)
-- [Production Deployment Guide](file:///f:/anti/26-june-leetcode-v0-assignment-main/docs/DEPLOYMENT.md)

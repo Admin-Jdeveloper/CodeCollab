@@ -45,18 +45,6 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
           console.warn("Backend auth verification warning:", err);
         }
 
-        // Demo / Seamless quick-access login fallback:
-        // Allows testing without database setup if needed, or for instant guest access
-        if (email.length > 3 && password.length >= 4) {
-          const username = email.split("@")[0] || "Developer";
-          return {
-            id: `dev-${Buffer.from(email).toString("hex").slice(0, 12)}`,
-            name: username.charAt(0).toUpperCase() + username.slice(1),
-            email: email,
-            image: `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(email)}`,
-          };
-        }
-
         return null;
       },
     }),
@@ -65,6 +53,52 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     strategy: "jwt",
   },
   callbacks: {
+    async signIn({ user, account, profile }) {
+      if (account?.provider === "google") {
+        try {
+          const backendUrl = process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:3000";
+          const res = await fetch(`${backendUrl}/api/auth/oauth-sync`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              provider: account.provider,
+              providerAccountId: account.providerAccountId,
+              email: user.email || (profile as any)?.email,
+              name: user.name || (profile as any)?.name,
+              image: user.image || (profile as any)?.picture,
+              emailVerified: (profile as any)?.email_verified ? new Date() : null,
+              oauthData: {
+                type: account.type,
+                access_token: account.access_token,
+                refresh_token: account.refresh_token,
+                expires_at: account.expires_at,
+                token_type: account.token_type,
+                scope: account.scope,
+                id_token: account.id_token,
+                session_state: account.session_state,
+              },
+            }),
+          });
+
+          if (res.ok) {
+            const data = await res.json();
+            if (data.success && data.user) {
+              // Bind database User ID to the NextAuth user object
+              user.id = data.user.id;
+              user.name = data.user.name;
+              user.email = data.user.email;
+              user.image = data.user.image;
+              return true;
+            }
+          } else {
+            console.error("[Auth] OAuth sync failed with status:", res.status);
+          }
+        } catch (err) {
+          console.error("[Auth] OAuth sync network error:", err);
+        }
+      }
+      return true;
+    },
     async jwt({ token, user }) {
       if (user) {
         token.id = user.id;

@@ -1,27 +1,71 @@
 # Dependencies
 node_modules/
 */node_modules/
+.pnp
+.pnp.js
 
 # Next.js build output
 .next/
 */.next/
 out/
 dist/
+build/
+.turbo/
+.vercel/
+
+# TypeScript build info & cache
+*.tsbuildinfo
+.cache/
 
 # Logs
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
 
-# Environment files
-.env*.local
+# Environment files and credentials (strict recursive protection)
+.env
+.env.*
+!.env.example
+!.env.template
+*.env
+*.env.*
+!*.env.example
+!*.env.template
 
-# OS files
+# Operating System files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
-# Temporary runner files
+# IDE & Editor local settings
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# AI Agent, Skills & Assistant artifacts
+.agent/
+.agents/
+.cursor/
+.claude/
+.windsurf/
+.gemini/
+.impeccable/
+skills-lock.json
+
+# Temporary test, coverage & execution files
+coverage/
+.nyc_output/
 temp/
 tmp/
 *.exe
+*.o
+*.obj

@@ -237,18 +237,26 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
-// ── Liveness probe
-app.get("/health", (_req, res) => {
-  if (isShuttingDown) {
-    return res.status(503).json({ status: "shutting_down" });
-  }
-  res.json({
-    status: "ok",
-    activeRooms: roomFileCache.size,
-    totalConnectedUsers: Array.from(roomUsers.values()).reduce((s, m) => s + m.size, 0),
-    timestamp: new Date().toISOString(),
+// ── Liveness probe ──────────────────────────────────────────
+app.route("/health")
+  .get((_req, res) => {
+    if (isShuttingDown) {
+      return res.status(503).json({ status: "shutting_down", service: "sync" });
+    }
+    res.setHeader("Content-Type", "application/json");
+    res.status(200).json({
+      status: "ok",
+      service: "sync",
+      message: "Socket.IO service is alive",
+    });
+  })
+  .head((_req, res) => {
+    if (isShuttingDown) {
+      return res.sendStatus(503);
+    }
+    res.setHeader("Content-Type", "application/json");
+    res.sendStatus(200);
   });
-});
 
 // ── Readiness probe
 app.get("/ready", async (_req, res) => {
@@ -1284,66 +1292,139 @@ io.on("connection", (socket: Socket) => {
 
       const filesSnapshot = commit.filesSnapshot as Array<{ path: string; name: string; language: string; content: string }> | null;
 
-      if (filesSnapshot && filesSnapshot.length > 0) {
-        const fileCache = await ensureRoomHydrated(roomId);
-        const newFileCache: RoomFileCache = new Map();
-
-        for (const f of filesSnapshot) {
-          const oldState = fileCache.get(f.path);
-          const nextVersion = (oldState?.version || 1) + 1;
-
-          const updated = await prisma.file.upsert({
-            where: { roomId_path: { roomId, path: f.path } },
-            create: { roomId, path: f.path, name: f.name, content: f.content, language: f.language, version: nextVersion },
-            update: { content: f.content, language: f.language, version: nextVersion },
-          });
-
-          const ydoc = new Y.Doc();
-          if (f.content) {
-            ydoc.getText("monaco").insert(0, f.content);
-          }
-
-          newFileCache.set(f.path, {
-            id: updated.id,
-            path: f.path,
-            name: f.name,
-            content: f.content,
-            language: f.language,
-            version: nextVersion,
-            updatedAt: new Date(),
-            ydoc,
-          });
-
-          // Broadcast authoritative Yjs update so all Monaco bindings converge
-          const rollbackUpdate = Y.encodeStateAsUpdate(ydoc);
-          io.to(roomId).emit("yjs_update", {
-            roomId,
-            filePath: f.path,
-            update: rollbackUpdate,
-          });
-          broadcastYjsUpdate(roomId, f.path, rollbackUpdate);
-        }
-
-        roomFileCache.set(roomId, newFileCache);
-
-        io.to(roomId).emit("rollback_applied", {
-          commitId,
-          commitMessage: commit.message,
-          filesSnapshot,
-          code: filesSnapshot[0]!.content,
-          language: filesSnapshot[0]!.language,
-        });
+      if (!filesSnapshot || filesSnapshot.length === 0) {
+        socket.emit("rollback_error", { error: "Snapshot contains no files" });
+        return;
       }
 
-      await prisma.commit.create({
-        data: {
+      // ── ATOMIC TRANSACTIONAL DATABASE RESTORATION ──
+      const restoredFiles = await prisma.$transaction(async (tx) => {
+        // 1. Fetch current database files for this workspace
+        const currentDbFiles = await tx.file.findMany({ where: { roomId } });
+        const snapshotPaths = new Set(filesSnapshot.map((f) => f.path));
+
+        // 2. Delete files that do NOT exist in the historical snapshot
+        const filesToDelete = currentDbFiles.filter((cf) => !snapshotPaths.has(cf.path));
+        if (filesToDelete.length > 0) {
+          await tx.file.deleteMany({
+            where: {
+              roomId,
+              id: { in: filesToDelete.map((f) => f.id) },
+            },
+          });
+        }
+
+        // 3. Upsert snapshot files with incremented monotonic versions
+        const savedFiles = [];
+        for (const f of filesSnapshot) {
+          const oldFile = currentDbFiles.find((cf) => cf.path === f.path);
+          const nextVersion = (oldFile?.version || 1) + 1;
+
+          const saved = await tx.file.upsert({
+            where: { roomId_path: { roomId, path: f.path } },
+            create: {
+              roomId,
+              path: f.path,
+              name: f.name,
+              content: f.content,
+              language: f.language,
+              version: nextVersion,
+            },
+            update: {
+              name: f.name,
+              content: f.content,
+              language: f.language,
+              version: nextVersion,
+            },
+          });
+          savedFiles.push(saved);
+        }
+
+        // 4. Update legacy room fields
+        await tx.room.update({
+          where: { id: roomId },
+          data: {
+            code: filesSnapshot[0]!.content,
+            language: filesSnapshot[0]!.language,
+          },
+        });
+
+        // 5. Create rollback marker commit
+        await tx.commit.create({
+          data: {
+            roomId,
+            message: `↩ Rolled back to: "${commit.message}"`,
+            code: filesSnapshot[0]!.content,
+            language: filesSnapshot[0]!.language,
+            filesSnapshot: filesSnapshot as any,
+            authorName: requestedBy ?? (user?.userName || "System"),
+            userId: user?.userId || null,
+          },
+        });
+
+        return savedFiles;
+      });
+
+      // ── UPDATE IN-MEMORY CACHE & YJS DOCS AFTER TRANSACTION COMMITS ──
+      const fileCache = await ensureRoomHydrated(roomId);
+      const snapshotPaths = new Set(filesSnapshot.map((f) => f.path));
+
+      // Destroy and purge memory cache for removed files
+      for (const [path, cachedState] of fileCache.entries()) {
+        if (!snapshotPaths.has(path)) {
+          if (cachedState.ydoc) cachedState.ydoc.destroy();
+          fileCache.delete(path);
+          io.to(roomId).emit("file_deleted", { filePath: path });
+        }
+      }
+
+      // Rebuild in-memory cache and broadcast Yjs sync updates
+      for (const saved of restoredFiles) {
+        let state = fileCache.get(saved.path);
+        if (!state) {
+          const ydoc = new Y.Doc();
+          if (saved.content) ydoc.getText("monaco").insert(0, saved.content);
+          state = {
+            id: saved.id,
+            path: saved.path,
+            name: saved.name,
+            content: saved.content,
+            language: saved.language,
+            version: saved.version,
+            updatedAt: saved.updatedAt,
+            ydoc,
+          };
+          fileCache.set(saved.path, state);
+        } else {
+          state.content = saved.content;
+          state.language = saved.language;
+          state.version = saved.version;
+          state.updatedAt = saved.updatedAt;
+          if (state.ydoc) {
+            const ytext = state.ydoc.getText("monaco");
+            state.ydoc.transact(() => {
+              ytext.delete(0, ytext.length);
+              ytext.insert(0, saved.content);
+            }, "rollback");
+          }
+        }
+
+        const rollbackUpdate = Y.encodeStateAsUpdate(state.ydoc);
+        io.to(roomId).emit("yjs_update", {
           roomId,
-          message: `↩ Rolled back to: "${commit.message}"`,
-          code: commit.code,
-          language: commit.language,
-          filesSnapshot: commit.filesSnapshot ?? undefined,
-          authorName: requestedBy ?? "System",
-        },
+          filePath: saved.path,
+          update: rollbackUpdate,
+        });
+        broadcastYjsUpdate(roomId, saved.path, rollbackUpdate);
+      }
+
+      // Broadcast rollback_applied to all peers in room
+      io.to(roomId).emit("rollback_applied", {
+        commitId,
+        commitMessage: commit.message,
+        filesSnapshot,
+        code: filesSnapshot[0]!.content,
+        language: filesSnapshot[0]!.language,
       });
     } catch (err) {
       console.error("[VCS] rollback failed:", err);

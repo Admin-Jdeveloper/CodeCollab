@@ -14,7 +14,6 @@ import {
   AlertCircle,
   Eye,
   EyeOff,
-  Terminal,
 } from "lucide-react";
 import Link from "next/link";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
@@ -110,34 +109,6 @@ function LoginForm() {
   const handleOAuthSignIn = (provider: string) => {
     setLoading(true);
     signIn(provider, { callbackUrl: safeCallbackUrl });
-  };
-
-  const handleQuickDemo = async (role: "alice" | "bob") => {
-    setLoading(true);
-    setError("");
-    const demoEmail = role === "alice" ? "alice@codecollab.dev" : "bob@codecollab.dev";
-    const demoPassword = "Password123!";
-
-    try {
-      const res = await signIn("credentials", {
-        email: demoEmail,
-        password: demoPassword,
-        redirect: false,
-      });
-
-      if (res?.error) {
-        setError("Demo login failed. Verify database seeding.");
-        toast.error("Demo login failed");
-      } else {
-        toast.success(`Signed in as ${role === "alice" ? "Alice" : "Bob"}`);
-        router.push(safeCallbackUrl);
-        router.refresh();
-      }
-    } catch {
-      setError("Failed to sign in demo user");
-    } finally {
-      setLoading(false);
-    }
   };
 
   return (
@@ -305,35 +276,6 @@ function LoginForm() {
               )}
             </Button>
           </form>
-
-          {/* Quick Demo 1-Click Profiles */}
-          <div className="mt-5 pt-4 border-t border-[#D4D4D4] dark:border-[#27272A]">
-            <div className="text-xs font-medium text-[#71717A] dark:text-[#A1A1AA] mb-2 flex items-center justify-between">
-               {/* <span className="flex items-center gap-1.5 text-[#18181B] dark:text-[#F5F5F5] text-[11px] font-semibold">
-                <Terminal className="w-3 h-3 text-[#7DB9E8] dark:text-[#A8D8FF]" />
-                1-Click Demo Profiles
-              </span> */}
-              {/* <span className="text-[10px] text-[#71717A] dark:text-[#52525B] font-mono">Test sync</span> */}
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => handleQuickDemo("alice")}
-                disabled={loading}
-                className="py-1.5 px-2.5 rounded-lg bg-[#F2F2F0] dark:bg-[#181818] hover:bg-[#E8E1D5]/80 dark:hover:bg-[#27272A] border border-[#D4D4D4] dark:border-[#27272A] text-[11px] font-medium text-[#18181B] dark:text-[#E8E1D5] transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
-              >
-                <span>STUDENT</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => handleQuickDemo("bob")}
-                disabled={loading}
-                className="py-1.5 px-2.5 rounded-lg bg-[#F2F2F0] dark:bg-[#181818] hover:bg-[#E8E1D5]/80 dark:hover:bg-[#27272A] border border-[#D4D4D4] dark:border-[#27272A] text-[11px] font-medium text-[#18181B] dark:text-[#E8E1D5] transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
-              >
-                <span>TEACHER</span>
-              </button>
-            </div>
-          </div>
 
           {/* Mode Switcher */}
           <div className="mt-4 text-center text-xs text-[#71717A] dark:text-[#A1A1AA]">
