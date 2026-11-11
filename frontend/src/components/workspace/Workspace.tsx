@@ -113,7 +113,7 @@ main();
 def main():
     print("Welcome to CodeCollab Python Workspace!")
     nums = [1, 2, 3, 4, 5]
-    print("Numbers:", nums)
+    print(f"Squares: {[x**2 for x in nums]}")
 
 if __name__ == "__main__":
     main()
@@ -675,6 +675,7 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
   useEffect(() => {
     return () => {
       yjsManagerRef.current?.destroy();
+      yjsManagerRef.current = null;
     };
   }, []);
 
@@ -686,16 +687,13 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
       const yjsManager = yjsManagerRef.current;
       if (!ed || !monaco || !yjsManager) return;
 
-      const existingFile = filesRef.current.find((f) => f.path === filePath);
-      const defaultContent = STARTER_CONTENT[language] || `// ${filePath.replace(/^\//, "")}\n`;
-      const placeholderText = existingFile?.content || defaultContent;
-
       const uri = monaco.Uri.parse(`inmemory://workspace/${filePath.replace(/^\//, "")}`);
       let model = monaco.editor.getModel(uri);
 
+      const docText = yjsManager.getText(filePath);
+
       if (!model || model.isDisposed()) {
-        const docText = yjsManager.getText(filePath);
-        model = monaco.editor.createModel(docText || placeholderText, langFromMonaco(language), uri);
+        model = monaco.editor.createModel(docText, langFromMonaco(language), uri);
       } else {
         monaco.editor.setModelLanguage(model, langFromMonaco(language));
       }
@@ -704,7 +702,12 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
         ed.setModel(model);
       }
 
-      yjsManager.bindMonaco(filePath, ed, model, placeholderText);
+      // Avoid double-binding if model is already active and bound to this filePath
+      if (yjsManager.activeBindingPath === filePath && ed.getModel() === model) {
+        return;
+      }
+
+      yjsManager.bindMonaco(filePath, ed, model);
     },
     []
   );
@@ -784,13 +787,10 @@ export default function Workspace({ roomId, initialSession }: WorkspaceProps) {
     const path = `/${name}`;
     const content = STARTER_CONTENT[language] ?? `// ${name}\n`;
 
-    // 1. Pre-seed local Yjs document with starter template
-    yjsManagerRef.current?.createFile(path, content);
-
-    // 2. Emit file_created to server and peers
+    // 1. Emit file_created to server so authoritative Y.Doc is seeded
     emitFileCreated(path, name, language, content);
 
-    // 3. Update local files state
+    // 2. Update local files state
     setFiles((prev) => {
       if (prev.some((f) => f.path === path)) return prev;
       return [...prev, { path, name, language, content }];

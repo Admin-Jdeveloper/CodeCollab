@@ -245,6 +245,10 @@ export class YjsWorkspaceManager {
     this._socket = socket ?? null;
   }
 
+  public get activeBindingPath(): string | null {
+    return this._activeBindingPath;
+  }
+
   public markRoomJoined(joined: boolean = true) {
     this._isRoomJoined = joined;
     if (joined && this._socket && this._socket.connected) {
@@ -329,8 +333,7 @@ export class YjsWorkspaceManager {
   public bindMonaco(
     filePath: string,
     editorInstance: editor.IStandaloneCodeEditor,
-    model: editor.ITextModel,
-    placeholderContent?: string
+    model: editor.ITextModel
   ): MonacoBinding {
     // 1. Unbind previous active binding if switching from another file
     if (this._activeBindingPath && this._activeBindingPath !== filePath) {
@@ -339,52 +342,36 @@ export class YjsWorkspaceManager {
     // Also unbind any old binding specifically for this file
     this.unbindMonaco(filePath);
 
-    const { doc, provider } = this.getOrCreate(filePath, placeholderContent);
+    const { doc, provider } = this.getOrCreate(filePath);
     const ytext = doc.getText("monaco");
 
-    // Helper to safely mount MonacoBinding without double-initialization
-    const attachBinding = (): MonacoBinding => {
-      // Unbind any stale binding on this path
-      const old = this._bindings.get(filePath);
-      if (old) {
-        try {
-          old.destroy();
-        } catch {}
-        this._bindings.delete(filePath);
-      }
+    // Clean existing binding on this path
+    const old = this._bindings.get(filePath);
+    if (old) {
+      try {
+        old.destroy();
+      } catch {}
+      this._bindings.delete(filePath);
+    }
 
-      const ytextStr = ytext.toString();
-      if (ytextStr.length > 0 && model.getValue() !== ytextStr) {
-        model.setValue(ytextStr);
-      }
+    const ytextStr = ytext.toString();
+    if (ytextStr.length > 0 && model.getValue() !== ytextStr) {
+      model.setValue(ytextStr);
+    } else if (ytextStr.length === 0 && model.getValue().length > 0) {
+      // Prevent duplication: do NOT leave stale/duplicate text in model while Y.Text syncs
+      model.setValue("");
+    }
 
-      const binding = new MonacoBinding(
-        ytext,
-        model,
-        new Set([editorInstance]),
-        null
-      );
-      this._bindings.set(filePath, binding);
-      this._activeBindingPath = filePath;
-      return binding;
-    };
-
+    const binding = new MonacoBinding(
+      ytext,
+      model,
+      new Set([editorInstance]),
+      null
+    );
+    this._bindings.set(filePath, binding);
     this._activeBindingPath = filePath;
 
-    if (provider.synced || ytext.length > 0) {
-      // Document already holds authoritative CRDT state; bind synchronously
-      return attachBinding();
-    }
-
-    // While initial sync is pending, show placeholder content without modifying CRDT
-    if (placeholderContent && model.getValue() !== placeholderContent) {
-      model.setValue(placeholderContent);
-    }
-
-    // Attach binding immediately; when Step 2 arrives Yjs will update model via observer
-    const binding = attachBinding();
-
-    // In case Step 2 resolves, ensure model is aligned
+    // When sync resolves, align model with authoritative Yjs document text
     provider.onSynced(() => {
       if (this._activeBindingPath === filePath) {
         const syncedStr = ytext.toString();
